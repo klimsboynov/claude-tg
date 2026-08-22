@@ -81,12 +81,86 @@ def is_interactive_prompt(screen: str) -> bool:
 
 
 def prompt_signature(screen: str) -> str:
-    """Stable identity of a prompt screen, ignoring volatile (timer) lines."""
-    return "\n".join(
-        line
-        for line in screen.splitlines()
-        if line.strip() and not _VOLATILE_LINE.search(line)
+    """Stable identity of a prompt screen.
+
+    Drops volatile (timer) lines and the leading highlight marker (``❯``) so a
+    moving selection cursor doesn't read as a different prompt.
+    """
+    out = []
+    for line in screen.splitlines():
+        if not line.strip() or _VOLATILE_LINE.search(line):
+            continue
+        out.append(re.sub(r"^\s*[❯>›»]\s*", "", line).rstrip())
+    return "\n".join(out)
+
+
+# A menu option line: optional highlight marker, a number, ``.`` or ``)``, label.
+_OPTION_RE = re.compile(r"^\s*(?:[❯>›»]\s*)?(\d+)[.)]\s+(\S.*?)\s*$")
+
+
+def _is_boundary(line: str) -> bool:
+    """A line that ends an option's description block."""
+    s = line.strip()
+    if not s or set(s) <= set("─—-=_• "):
+        return True
+    if _OPTION_RE.match(line):
+        return True
+    low = s.lower()
+    return any(
+        k in low for k in ("to navigate", "enter to select", "esc to cancel")
     )
+
+
+def parse_menu(screen: str) -> Optional[dict]:  # type: ignore[type-arg]
+    """Parse a TUI selection window into ``{title, options:[(n, label, desc)]}``.
+
+    ``desc`` is the indented description block under an option (joined to one
+    line), or "" when none is shown. Keeps only the contiguous ``1..N`` run so
+    stray numbered lines in the scrollback can't leak in. Returns None if
+    there's no option numbered 1.
+    """
+    lines = screen.splitlines()
+    numbered: dict = {}  # n -> (label, line_index)
+    first_idx: Optional[int] = None
+    for idx, line in enumerate(lines):
+        m = _OPTION_RE.match(line)
+        if m:
+            numbered[int(m.group(1))] = (m.group(2).strip(), idx)
+            if first_idx is None:
+                first_idx = idx
+    if 1 not in numbered:
+        return None
+
+    def _desc(start: int) -> str:
+        out = []
+        for j in range(start + 1, len(lines)):
+            if _is_boundary(lines[j]):
+                break
+            out.append(lines[j].strip())
+        return " ".join(out)
+
+    options = []
+    i = 1
+    while i in numbered:
+        label, idx = numbered[i]
+        options.append((i, label, _desc(idx)))
+        i += 1
+
+    title = "Claude is asking"
+    if first_idx is not None:
+        for line in reversed(lines[:first_idx]):
+            s = line.strip()
+            if not s or set(s) <= set("─—-=_• "):
+                continue
+            low = s.lower()
+            if any(
+                k in low
+                for k in ("to navigate", "enter to select", "esc to cancel")
+            ):
+                continue
+            title = s
+            break
+    return {"title": title, "options": options}
 
 
 def _newest_jsonl(proj_dir: Path) -> Optional[Path]:

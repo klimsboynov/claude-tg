@@ -37,6 +37,7 @@ from ..projects import PrivateTopicsUnavailableError
 from .features.claude_jsonl import (
     claude_project_dir,
     is_interactive_prompt,
+    parse_menu,
     prompt_signature,
     render_record,
     resolve_session_file,
@@ -644,6 +645,14 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_tmux_callback),
                 pattern=r"^tmux(sel:|off)",
+            )
+        )
+
+        # tmux menu-option callbacks (interactive prompt buttons)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_tmux_option_callback),
+                pattern=r"^tmuxopt:",
             )
         )
 
@@ -2466,16 +2475,88 @@ class MessageOrchestrator:
         sig = prompt_signature(screen)
         if sig == last_prompt:
             return last_prompt  # already shown this exact prompt
-        await self._mirror_send(
-            bot,
-            chat_id,
-            "⌨️ <b>Claude needs your input:</b>\n"
-            + self._format_pane(screen)
-            + "\nReply with the option number, or "
-            "/key Up · /key Down · /key Enter.",
-            "HTML",
-        )
+
+        menu = parse_menu(screen)
+        if menu:
+            rows = [
+                [
+                    InlineKeyboardButton(
+                        f"{n}. {label}"[:60], callback_data=f"tmuxopt:{n}"
+                    )
+                ]
+                for n, label, _desc in menu["options"]
+            ]
+            rows.append(
+                [InlineKeyboardButton("✕ Cancel (Esc)", callback_data="tmuxopt:esc")]
+            )
+            body_lines = []
+            for n, label, desc in menu["options"]:
+                line = f"<b>{n}.</b> {escape_html(label)}"
+                if desc:
+                    short = desc if len(desc) <= 160 else desc[:160] + "…"
+                    line += f"\n    <i>{escape_html(short)}</i>"
+                body_lines.append(line)
+            body = "\n".join(body_lines)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⌨️ <b>{escape_html(menu['title'])}</b>\n\n{body}",
+                    reply_markup=InlineKeyboardMarkup(rows),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning("menu send failed", chat_id=chat_id, error=str(e))
+        else:
+            # Free-form prompt (no clean numbered options) -> snapshot + hint.
+            await self._mirror_send(
+                bot,
+                chat_id,
+                "⌨️ <b>Claude needs your input:</b>\n"
+                + self._format_pane(screen)
+                + "\nReply, or /key Up · /key Down · /key Enter.",
+                "HTML",
+            )
         return sig
+
+    async def _handle_tmux_option_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle tmuxopt:<n> / tmuxopt:esc menu-button taps."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data or ""
+        choice = data.split(":", 1)[1] if ":" in data else ""
+        chat_id = update.effective_chat.id
+
+        b = self._binding(chat_id)
+        if not b:
+            await query.edit_message_text("⚠️ Not bound to a session anymore.")
+            return
+        bridge = self._tmux(b["target"])
+        ok, detail = await bridge.available()
+        if not ok:
+            self._clear_binding(chat_id)
+            self._stop_jsonl_mirror(chat_id)
+            await query.edit_message_text(
+                f"⚠️ {escape_html(detail)}", parse_mode="HTML"
+            )
+            return
+
+        if choice == "esc":
+            await bridge.send_key("Escape")
+            await query.edit_message_text("✕ Cancelled (Esc).")
+            return
+
+        # Press the number; some menus submit on the digit alone, others need
+        # Enter, so confirm with Enter only if a menu is still on screen.
+        await bridge.send_key(choice)
+        await asyncio.sleep(0.4)
+        try:
+            if is_interactive_prompt(await bridge.capture()):
+                await bridge.send_key("Enter")
+        except Exception:
+            pass
+        await query.edit_message_text(f"✅ Selected option {escape_html(choice)}.")
 
     async def _jsonl_mirror_loop(
         self,
