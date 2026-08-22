@@ -299,6 +299,13 @@ class Settings(BaseSettings):
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
     api_server_port: int = Field(8080, description="Webhook API server port")
     enable_scheduler: bool = Field(False, description="Enable job scheduler")
+    tmux_bridge_target: str = Field(
+        "claude",
+        description=(
+            "tmux target (session name or session:window.pane) for the "
+            "/tmux bridge that types into an interactive Claude session"
+        ),
+    )
     github_webhook_secret: Optional[str] = Field(
         None, description="GitHub webhook HMAC secret"
     )

@@ -1,0 +1,42 @@
+[Unit]
+Description=Claude Code Telegram Bot
+Documentation=https://github.com/RichardAtCT/claude-code-telegram
+# Bring up after the network and the local Clash proxy the bot egresses through.
+After=network-online.target clashvless.service
+Wants=network-online.target clashvless.service
+# Give up (don't hammer Telegram/Anthropic) if it crash-loops on a hard error
+# such as a bad token: 5 failures within 5 min -> enter failed state.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=k
+WorkingDirectory=/home/k/git/claude-code-telegram
+ExecStart=/home/k/git/claude-code-telegram/.venv/bin/claude-telegram-bot
+
+# HOME is required: Claude reads its CLI auth from ~/.claude, and the /resume
+# picker resolves ~/.claude/projects via Path.home().
+Environment=HOME=/home/k
+Environment=PATH=/home/k/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Route the Telegram API and the spawned Claude CLI through Clash (mixed
+# HTTP/SOCKS port). Also present in .env; set here so it is in the environment
+# before the app starts, and inherited by the claude subprocess.
+Environment=HTTP_PROXY=http://localhost:1900
+Environment=HTTPS_PROXY=http://localhost:1900
+Environment=NO_PROXY=localhost,127.0.0.1
+
+Restart=always
+RestartSec=10
+# Graceful shutdown: the bot handles SIGTERM (stops polling, closes the DB).
+TimeoutStopSec=30
+KillMode=control-group
+
+SyslogIdentifier=claude-telegram-bot
+
+# NOTE: no filesystem sandboxing (ProtectHome/ReadOnlyPaths/etc.). This bot
+# runs Claude Code, which executes arbitrary user commands in APPROVED_DIRECTORY
+# by design, so locking down the home/filesystem would break it.
+
+[Install]
+WantedBy=multi-user.target

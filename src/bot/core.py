@@ -74,6 +74,10 @@ class ClaudeCodeBot:
         proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
         if proxy_url:
             builder.proxy(proxy_url)
+            # The getUpdates long-polling connection uses a separate httpx
+            # client; without this it would bypass the proxy and hang in a
+            # proxy-only / geo-restricted environment.
+            builder.get_updates_proxy(proxy_url)
             logger.info("Proxy configured", proxy=proxy_url)
 
         self.app = builder.build()
@@ -229,6 +233,12 @@ class ClaudeCodeBot:
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
                 )
+
+                # Reconnect any live tmux mirrors from before a restart.
+                try:
+                    await self.orchestrator.restore_mirrors(self.app.bot)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("Failed to restore tmux mirrors", error=str(e))
 
                 # Keep running until manually stopped
                 while self.is_running:
