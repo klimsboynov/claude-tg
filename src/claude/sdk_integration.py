@@ -298,8 +298,20 @@ class ClaudeSDKManager:
 
             # Build system prompt, loading CLAUDE.md from working directory if present
             base_prompt = (
+                "You are running headlessly (-p mode) as a Telegram bot: the "
+                "user only ever sees your FINAL text message — never your tool "
+                "calls, tool output, or intermediate steps. Therefore you MUST "
+                "end every single turn with a concise plain-text reply that "
+                "directly answers the user, even after running tools. Never end "
+                "a turn on a tool call with no text; if you ran a command to "
+                "find something, state the result in words. "
                 f"All file operations must stay within {working_directory}. "
-                "Use relative paths."
+                "Use relative paths. "
+                "To deliver a file to the user over Telegram, output a line "
+                "containing exactly [[TG_SEND: <path>]] (one marker per file), "
+                "where <path> points to a file inside the working directory. "
+                "Only do this when the user explicitly asks to receive, send, "
+                "upload, or download a file; otherwise never emit that marker."
             )
             claude_md_path = Path(working_directory) / "CLAUDE.md"
             if claude_md_path.exists():
@@ -565,10 +577,11 @@ class ClaudeSDKManager:
                     previous_session_id=session_id,
                 )
 
-            # Use ResultMessage.result if available, fall back to message extraction
-            if result_content is not None:
-                content = str(result_content).strip()
-            else:
+            # Prefer ResultMessage.result; if it is missing OR empty (turn ended
+            # on a tool call, or max_turns was hit), fall back to the assistant's
+            # own text blocks before resorting to the generic tool-summary line.
+            content = str(result_content).strip() if result_content else ""
+            if not content:
                 content_parts = []
                 for msg in messages:
                     if isinstance(msg, AssistantMessage):
