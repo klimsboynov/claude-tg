@@ -50,6 +50,13 @@ def setup_logging(debug: bool = False) -> None:
         stream=sys.stdout,
     )
 
+    # httpx/httpcore log each request URL at INFO, and for PTB that URL embeds
+    # the bot token (…/bot<token>/getUpdates) on every ~10s poll — a full-control
+    # secret written to the journal repeatedly. Silence them to WARNING (errors
+    # still surface) so the token stays out of the logs.
+    for _noisy in ("httpx", "httpcore"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
+
     # Configure structlog
     structlog.configure(
         processors=[

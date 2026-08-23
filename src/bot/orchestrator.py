@@ -567,6 +567,15 @@ class MessageOrchestrator:
             group=10,
         )
 
+        # Video / animation / video-note uploads -> Claude
+        app.add_handler(
+            MessageHandler(
+                filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION,
+                self._inject_deps(self.agentic_video),
+            ),
+            group=10,
+        )
+
         # Voice messages -> transcribe -> Claude
         app.add_handler(
             MessageHandler(filters.VOICE, self._inject_deps(self.agentic_voice)),
@@ -875,6 +884,17 @@ class MessageOrchestrator:
             await self._prompt_bind(update)
             return
         await self._tmux_photo(update, context, binding)
+        return
+
+    async def agentic_video(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Deliver a video / animation / video-note into the bound session's cwd."""
+        binding = self._binding(update.effective_chat.id)
+        if not binding:
+            await self._prompt_bind(update)
+            return
+        await self._tmux_video(update, context, binding)
         return
 
     async def agentic_voice(
@@ -1335,11 +1355,18 @@ class MessageOrchestrator:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         binding: Dict[str, str],
-        tg_file: Any,
+        media: Any,
         filename: str,
         caption: str,
     ) -> None:
-        """Download a Telegram file into the pane's cwd and tell the session."""
+        """Stage a Telegram file into the pane's cwd, off the update lock.
+
+        The heavy work -- get_file() (which pulls the bytes when a local Bot
+        API server is used) plus the hardlink/copy -- runs in a background
+        task, so a big upload doesn't hold the sequential update lock and
+        freeze every other message. An immediate "receiving" reply is edited
+        in place to the final result.
+        """
         chat_id = update.effective_chat.id
         target = binding["target"]
         bridge = self._tmux(target)
@@ -1354,25 +1381,88 @@ class MessageOrchestrator:
         cwd = await bridge.pane_cwd() or str(self.settings.approved_directory)
         safe = os.path.basename(filename) or "upload.bin"
         dest = Path(cwd) / safe
+        size = getattr(media, "file_size", None)
+        if size and size >= 1024**3:
+            human = f" ({size / 1024**3:.1f}GB)"
+        elif size:
+            human = f" ({size / 1024**2:.1f}MB)"
+        else:
+            human = ""
+        status = await update.message.reply_text(
+            f"⏳ receiving <code>{escape_html(safe)}</code>{human}…",
+            parse_mode="HTML",
+        )
+        # Off the sequential update lock: fetch + stage, then notify.
+        context.application.create_task(
+            self._deliver_file_bg(
+                update, context, binding, media, safe, dest, caption, status
+            ),
+            update=update,
+        )
+
+    async def _deliver_file_bg(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        binding: Dict[str, str],
+        media: Any,
+        safe: str,
+        dest: Path,
+        caption: str,
+        status: Any,
+    ) -> None:
+        """Background worker: pull the file, hardlink/copy it into the pane's
+        cwd, then inject the path into the session and edit the reply."""
+        chat_id = update.effective_chat.id
+        target = binding["target"]
         try:
-            await tg_file.download_to_drive(str(dest))
+            tg_file = await media.get_file()
+            await self._stage_file(tg_file, dest)
         except Exception as e:
-            logger.warning("tmux file download failed", error=str(e))
-            await update.message.reply_text("⚠️ Failed to download the file.")
+            logger.warning("tmux file receive failed", error=str(e), file=safe)
+            if "too big" in str(e).lower():
+                msg = (
+                    "⚠️ Telegram refused it: exceeds the Bot API 20MB getFile "
+                    "limit. Run a local Bot API server (deploy/LOCAL_BOTAPI.md) "
+                    "for up to 2GB, or side-channel the file into the cwd."
+                )
+            else:
+                msg = "⚠️ Failed to receive the file."
+            try:
+                await status.edit_text(msg)
+            except Exception:
+                pass
             return
         flat = " ".join((caption or "").split())
         note = f"[uploaded file saved to: {dest}]"
         typed = f"{flat} {note}".strip() if flat else note
         if binding.get("mode") == "mirror":
             self._note_echo(chat_id, typed)
-        await bridge.send_text(typed)
-        await self._audit_tmux(update, context, f"file:{target}")
-        await update.message.reply_text(
-            f"📎 <code>{escape_html(safe)}</code> → "
-            f"<code>{escape_html(target)}</code>\n"
-            f"<code>{escape_html(str(dest))}</code>",
-            parse_mode="HTML",
-        )
+        try:
+            await self._tmux(target).send_text(typed)
+            await self._audit_tmux(update, context, f"file:{target}")
+            await status.edit_text(
+                f"📎 <code>{escape_html(safe)}</code> → "
+                f"<code>{escape_html(target)}</code>\n"
+                f"<code>{escape_html(str(dest))}</code>",
+                parse_mode="HTML",
+            )
+        except Exception as e:
+            logger.warning("tmux file notify failed", error=str(e), file=safe)
+
+    async def _stage_file(self, tg_file: Any, dest: Path) -> None:
+        """Hardlink the local-server file into dest (instant, no extra disk);
+        fall back to a real download/copy across filesystems or in cloud mode."""
+        src = getattr(tg_file, "file_path", None)
+        if src and os.path.isabs(str(src)) and os.path.exists(src):
+            try:
+                if dest.exists():
+                    dest.unlink()
+                os.link(src, dest)
+                return
+            except OSError:
+                pass  # EXDEV (cross-filesystem) or perms -> fall back to copy
+        await tg_file.download_to_drive(str(dest))
 
     async def _tmux_document(
         self,
@@ -1387,18 +1477,11 @@ class MessageOrchestrator:
             if not valid:
                 await update.message.reply_text(f"File rejected: {error}")
                 return
-        if document.file_size and document.file_size > 20 * 1024 * 1024:
-            await update.message.reply_text(
-                f"File too large ({document.file_size / 1024 / 1024:.1f}MB). "
-                "Bot download limit is 20MB."
-            )
-            return
-        tg_file = await document.get_file()
         await self._tmux_deliver_file(
             update,
             context,
             binding,
-            tg_file,
+            document,
             document.file_name or "upload.bin",
             update.message.caption or "",
         )
@@ -1410,10 +1493,32 @@ class MessageOrchestrator:
         binding: Dict[str, str],
     ) -> None:
         photo = update.message.photo[-1]
-        tg_file = await photo.get_file()
         fname = f"photo_{update.message.message_id}.jpg"
         await self._tmux_deliver_file(
-            update, context, binding, tg_file, fname, update.message.caption or ""
+            update, context, binding, photo, fname, update.message.caption or ""
+        )
+
+    async def _tmux_video(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        binding: Dict[str, str],
+    ) -> None:
+        message = update.message
+        media = message.video or message.animation or message.video_note
+        if media is None:
+            return
+        filename = getattr(media, "file_name", None) or (
+            f"video_{message.message_id}.mp4"
+        )
+        security_validator = context.bot_data.get("security_validator")
+        if security_validator:
+            valid, error = security_validator.validate_filename(filename)
+            if not valid:
+                await message.reply_text(f"File rejected: {error}")
+                return
+        await self._tmux_deliver_file(
+            update, context, binding, media, filename, message.caption or ""
         )
 
     async def _tmux_voice(

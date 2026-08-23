@@ -42,6 +42,20 @@ class Settings(BaseSettings):
         ..., description="Telegram bot token from BotFather"
     )
     telegram_bot_username: str = Field(..., description="Bot username without @")
+    telegram_base_url: Optional[str] = Field(
+        None,
+        description=(
+            "Base URL of a local Bot API server (telegram-bot-api --local), e.g. "
+            "http://localhost:8081/bot. Unset -> api.telegram.org (20MB file cap)."
+        ),
+    )
+    telegram_base_file_url: Optional[str] = Field(
+        None,
+        description=(
+            "File base URL of a local Bot API server, e.g. "
+            "http://localhost:8081/file/bot. Pair with telegram_base_url."
+        ),
+    )
 
     # Security
     approved_directory: Path = Field(..., description="Base directory for projects")

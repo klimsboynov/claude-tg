@@ -75,8 +75,20 @@ class TmuxBridge:
     qualified ``session:window.pane``.
     """
 
+    # Serialize the multi-step send_text sequence per target across all bridge
+    # instances (callers build a fresh TmuxBridge each time), so concurrent
+    # sends -- e.g. a backgrounded file-delivery note racing a typed message --
+    # can't interleave their send-keys and corrupt the composer.
+    _send_locks: Dict[str, asyncio.Lock] = {}
+
     def __init__(self, target: str) -> None:
         self.target = target
+
+    def _send_lock(self) -> asyncio.Lock:
+        lock = TmuxBridge._send_locks.get(self.target)
+        if lock is None:
+            lock = TmuxBridge._send_locks[self.target] = asyncio.Lock()
+        return lock
 
     def _session_name(self) -> str:
         """has-session wants a session, not a pane; drop any :win.pane suffix."""
@@ -122,13 +134,14 @@ class TmuxBridge:
         text as typed input rather than a paste whose trailing newline just
         inserts a line break.
         """
-        # Clear any leftover text in the composer (no-op when already empty).
-        await self._run("send-keys", "-t", self.target, "C-u")
-        # -l = literal: don't interpret the text as tmux key names.
-        await self._run("send-keys", "-t", self.target, "-l", text)
-        await asyncio.sleep(0.2)
-        # Enter as a separate, non-literal keypress submits the prompt.
-        await self._run("send-keys", "-t", self.target, "Enter")
+        async with self._send_lock():
+            # Clear leftover text in the composer (no-op when already empty).
+            await self._run("send-keys", "-t", self.target, "C-u")
+            # -l = literal: don't interpret the text as tmux key names.
+            await self._run("send-keys", "-t", self.target, "-l", text)
+            await asyncio.sleep(0.2)
+            # Enter as a separate, non-literal keypress submits the prompt.
+            await self._run("send-keys", "-t", self.target, "Enter")
 
     async def send_key(self, key: str) -> None:
         """Send a single named key (Enter, Escape, C-c, Up, y, ...)."""

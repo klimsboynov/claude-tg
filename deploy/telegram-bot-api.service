@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram Bot API server (local mode, 2GB file limit)
+Documentation=https://github.com/tdlib/telegram-bot-api
+After=network-online.target
+Wants=network-online.target
+# Start before the bot so its base_url endpoint is up first.
+Before=claude-telegram-bot.service
+
+[Service]
+Type=simple
+User=k
+# api_id/api_hash (staged from the realestate 'test_dot' account; chmod 600).
+# systemd (root) reads it fine even though it lives under /home/k.
+EnvironmentFile=/home/k/.config/telegram-bot-api/env
+# Keep the file store on the SAME filesystem as your project dirs
+# (/home/k/git/...) so the bot HARDLINKS downloads into a session's cwd
+# instantly (no 2GB copy); it falls back to a copy across filesystems.
+ExecStartPre=/usr/bin/mkdir -p /home/k/.local/share/telegram-bot-api/tmp
+# api_id/api_hash are read from the EnvironmentFile (TELEGRAM_API_ID /
+# TELEGRAM_API_HASH) — NOT passed as flags — so they never appear in `ps`.
+ExecStart=/usr/bin/telegram-bot-api \
+    --local \
+    --http-ip-address=127.0.0.1 \
+    --http-port=8081 \
+    --dir=/home/k/.local/share/telegram-bot-api \
+    --temp-dir=/home/k/.local/share/telegram-bot-api/tmp \
+    --proxy=http://localhost:1900
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

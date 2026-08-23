@@ -64,21 +64,34 @@ class ClaudeCodeBot:
         builder.write_timeout(30)
         builder.pool_timeout(30)
 
-        # Explicitly set proxy from environment variables.
-        # This is necessary because python-telegram-bot's Application.builder()
-        # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
-        # Without this, the httpx connection pool can become corrupted when running
-        # behind a proxy, causing the bot to stop responding to messages.
         import os
 
-        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
-        if proxy_url:
-            builder.proxy(proxy_url)
-            # The getUpdates long-polling connection uses a separate httpx
-            # client; without this it would bypass the proxy and hang in a
-            # proxy-only / geo-restricted environment.
-            builder.get_updates_proxy(proxy_url)
-            logger.info("Proxy configured", proxy=proxy_url)
+        # A local Bot API server (telegram-bot-api --local) lifts the 20MB
+        # getFile cap to 2GB. When it's configured the bot talks to it over
+        # localhost, so the cloud proxy must NOT be applied (it would try to
+        # proxy the localhost hop); the local server does its own egress to
+        # Telegram. In local mode getFile returns on-disk paths -> local_mode.
+        if self.settings.telegram_base_url:
+            builder.base_url(self.settings.telegram_base_url)
+            if self.settings.telegram_base_file_url:
+                builder.base_file_url(self.settings.telegram_base_file_url)
+            builder.local_mode(True)
+            logger.info(
+                "Using local Bot API server",
+                base_url=self.settings.telegram_base_url,
+            )
+        else:
+            # Explicitly set proxy from environment variables. PTB's builder
+            # does not auto-use HTTP_PROXY/HTTPS_PROXY, and without it the httpx
+            # connection pool can get corrupted behind a proxy, stalling the bot.
+            proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+            if proxy_url:
+                builder.proxy(proxy_url)
+                # The getUpdates long-polling connection uses a separate httpx
+                # client; without this it would bypass the proxy and hang in a
+                # proxy-only / geo-restricted environment.
+                builder.get_updates_proxy(proxy_url)
+                logger.info("Proxy configured", proxy=proxy_url)
 
         self.app = builder.build()
 
