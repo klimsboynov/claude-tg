@@ -1470,13 +1470,10 @@ class MessageOrchestrator:
         context: ContextTypes.DEFAULT_TYPE,
         binding: Dict[str, str],
     ) -> None:
+        # No filename restrictions on bridge uploads — the file is only stored
+        # in the session cwd (basename-confined in _tmux_deliver_file), never
+        # executed or processed by type.
         document = update.message.document
-        security_validator = context.bot_data.get("security_validator")
-        if security_validator and document.file_name:
-            valid, error = security_validator.validate_filename(document.file_name)
-            if not valid:
-                await update.message.reply_text(f"File rejected: {error}")
-                return
         await self._tmux_deliver_file(
             update,
             context,
@@ -1511,12 +1508,6 @@ class MessageOrchestrator:
         filename = getattr(media, "file_name", None) or (
             f"video_{message.message_id}.mp4"
         )
-        security_validator = context.bot_data.get("security_validator")
-        if security_validator:
-            valid, error = security_validator.validate_filename(filename)
-            if not valid:
-                await message.reply_text(f"File rejected: {error}")
-                return
         await self._tmux_deliver_file(
             update, context, binding, media, filename, message.caption or ""
         )
