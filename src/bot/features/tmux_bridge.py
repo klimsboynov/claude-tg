@@ -114,9 +114,19 @@ class TmuxBridge:
         return cmd if code == 0 and cmd else None
 
     async def send_text(self, text: str) -> None:
-        """Type ``text`` into the pane, then press Enter to submit."""
+        """Type ``text`` into the pane and submit it as its own message.
+
+        Clears the composer first (C-u) so anything already in the input box --
+        e.g. a queued message Esc/stop pushed back out of the queue -- can't
+        merge with this one, and pauses before Enter so the TUI registers the
+        text as typed input rather than a paste whose trailing newline just
+        inserts a line break.
+        """
+        # Clear any leftover text in the composer (no-op when already empty).
+        await self._run("send-keys", "-t", self.target, "C-u")
         # -l = literal: don't interpret the text as tmux key names.
         await self._run("send-keys", "-t", self.target, "-l", text)
+        await asyncio.sleep(0.2)
         # Enter as a separate, non-literal keypress submits the prompt.
         await self._run("send-keys", "-t", self.target, "Enter")
 
