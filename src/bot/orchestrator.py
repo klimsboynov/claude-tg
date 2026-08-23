@@ -827,11 +827,6 @@ class MessageOrchestrator:
                 return v[:60]
         return ""
 
-    @staticmethod
-
-
-
-
     async def agentic_text(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
