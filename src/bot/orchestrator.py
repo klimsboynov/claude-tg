@@ -1637,6 +1637,19 @@ class MessageOrchestrator:
         if sig == last_prompt:
             return last_prompt  # already shown this exact prompt
 
+        # A Usage/Stats panel (/usage) is a transient info overlay, not a real
+        # input prompt — Claude closes it with Esc, not a reply. Show the parsed
+        # card, then auto-Esc so the modal doesn't stay open swallowing the
+        # user's next message. Return sig so a lingering frame won't re-post.
+        card = render_usage(screen)
+        if card:
+            await self._mirror_send(bot, chat_id, card, "HTML")
+            try:
+                await self._tmux(target).send_key("Escape")
+            except Exception as e:
+                logger.warning("usage auto-dismiss failed", error=str(e))
+            return sig
+
         menu = parse_menu(screen)
         if menu:
             rows = [
