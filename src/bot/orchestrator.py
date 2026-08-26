@@ -682,6 +682,10 @@ class MessageOrchestrator:
                 BotCommand("tmux", "Pick/switch a live tmux session (tabs)"),
                 BotCommand("peek", "Snapshot the bound tmux pane"),
                 BotCommand("key", "Send a key to the bound pane (esc/y/c-c…)"),
+                # Passthrough commands: no bot handler — forwarded into the bound
+                # Claude session (autocomplete only). /usage now auto-dismisses.
+                BotCommand("usage", "Usage & limits — runs in the bound session"),
+                BotCommand("compact", "Compact the session's context (in-session)"),
                 BotCommand("stop", "Interrupt the current turn (Esc/Ctrl-C)"),
                 BotCommand("clear", "Delete recent messages in this chat"),
                 BotCommand("restart", "Restart the bot"),
