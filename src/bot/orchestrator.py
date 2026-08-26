@@ -43,6 +43,7 @@ from .features.claude_jsonl import (
 )
 from .features.tmux_bridge import TmuxBridge
 from .features.tmux_bridge import list_sessions as tmux_list_sessions
+from .features.usage_render import render_usage
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -1202,10 +1203,18 @@ class MessageOrchestrator:
         return TmuxBridge(target)
 
     def _format_pane(self, snapshot: str, max_chars: int = 3500) -> str:
-        """Render a pane snapshot as a Telegram-safe monospace block."""
+        """Render a pane snapshot as a Telegram-safe monospace block.
+
+        The Claude Code Usage/Stats panel is parsed into a compact card instead
+        of the raw (wide, misaligned) capture; everything else falls back to a
+        <pre> block.
+        """
         snapshot = snapshot.rstrip()
         if not snapshot:
             return "<i>(pane is empty)</i>"
+        pretty = render_usage(snapshot)
+        if pretty:
+            return pretty
         if len(snapshot) > max_chars:
             # Terminal output: the tail is what just happened -> keep it.
             snapshot = "…\n" + snapshot[-max_chars:]
