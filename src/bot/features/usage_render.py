@@ -86,16 +86,28 @@ def render_usage(snapshot: str) -> Optional[str]:
     if rows:
         out += ["", "<b>Limits</b>", *rows]
 
-    models = [
-        (m.group(1).replace("claude-", ""), float(m.group(2).replace(",", "")))
-        for m in re.finditer(
-            r"(claude-[\w.\-]+):[^\n]*\(\$([\d,]+(?:\.\d+)?)\)", text
-        )
-    ]
-    if models:
-        models.sort(key=lambda x: -x[1])
-        out += ["", "<b>By model</b>"]
-        out += [f"• {escape(n)} — ${c:,.2f}" for n, c in models]
+    # Isolate the "Usage by model:" block and pair names with costs by order.
+    # The cost lines are long and the narrow mirror terminal wraps them, so a
+    # single-line "name … ($cost)" regex loses wrapped rows — zip within the
+    # block instead (each name is followed by its own ($cost) in text order).
+    mblock = re.search(
+        r"Usage by model:(.*?)(?:\n[ \t]*\n|Current session|Current week|"
+        r"What's contributing|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if mblock:
+        block = mblock.group(1)
+        names = re.findall(r"claude-([\w.\-]+)\s*:", block)
+        costs = [
+            float(c.replace(",", ""))
+            for c in re.findall(r"\(\$([\d,]+(?:\.\d+)?)\)", block)
+        ]
+        models = list(zip(names, costs))
+        if models:
+            models.sort(key=lambda x: -x[1])
+            out += ["", "<b>By model</b>"]
+            out += [f"• {escape(n)} — ${c:,.2f}" for n, c in models]
 
     drivers = re.findall(r"(\d+)% of your usage (?:was|came from) ([^\n]+)", text)
     if drivers:
