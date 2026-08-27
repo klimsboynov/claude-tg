@@ -61,8 +61,11 @@ async def security_middleware(
             )
             return  # Block processing
 
-    # Validate file uploads if present
-    if message and message.document:
+    # Validate file uploads if present (classic mode only). In agentic mode the
+    # bridge delivers any file straight into the bound session's cwd — it's never
+    # opened or executed by type — so no extension/MIME gating, matching the
+    # text path above.
+    if message and message.document and not agentic_mode:
         is_safe, error_message = await validate_file_upload(
             message.document, security_validator, user_id, audit_logger
         )
