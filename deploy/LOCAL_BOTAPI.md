@@ -69,8 +69,10 @@ sudo systemctl start claude-telegram-bot
 ```
 
 ## Notes
-- `--proxy=http://localhost:1900` in the unit routes the *server's* egress through
-  your existing proxy (drop it if direct reachability is fine).
+- Egress: `--proxy` only covers *webhook* requests — tdlib's MTProto to the DCs
+  ignores it and env proxies. The unit therefore wraps the binary in
+  `proxychains4 -f /etc/proxychains-tbapi.conf` (socks5://127.0.0.1:1900), which
+  forces every connect() through the explicit proxy. No TUN needed.
 - Creds are read from the env file (`TELEGRAM_API_ID`/`TELEGRAM_API_HASH`), not
   passed as flags, so they don't show up in `ps`.
 - The 20 MB cap removal + video handler (this same change set) work regardless of

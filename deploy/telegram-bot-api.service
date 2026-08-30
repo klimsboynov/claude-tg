@@ -18,7 +18,12 @@ EnvironmentFile=/home/k/.config/telegram-bot-api/env
 ExecStartPre=/usr/bin/mkdir -p /home/k/.local/share/telegram-bot-api/tmp
 # api_id/api_hash are read from the EnvironmentFile (TELEGRAM_API_ID /
 # TELEGRAM_API_HASH) — NOT passed as flags — so they never appear in `ps`.
-ExecStart=/usr/bin/telegram-bot-api \
+#
+# proxychains4 wrapper: tdlib's MTProto to Telegram's DCs ignores env proxies
+# and --proxy (webhook-only), and this box has no direct route to Telegram.
+# The wrapper forces every connect() through socks5://127.0.0.1:1900
+# (config: /etc/proxychains-tbapi.conf) — explicit proxy, no TUN dependence.
+ExecStart=/usr/bin/proxychains4 -f /etc/proxychains-tbapi.conf /usr/bin/telegram-bot-api \
     --local \
     --http-ip-address=127.0.0.1 \
     --http-port=8081 \
