@@ -262,6 +262,16 @@ class Settings(BaseSettings):
         description="Conversational agentic mode (default) vs classic command mode",
     )
 
+    # Multi-server tmux bridge
+    tmux_remote_hosts: Optional[List[str]] = Field(
+        None,
+        description=(
+            "SSH host aliases whose tmux sessions the bridge can drive "
+            "(comma-separated; user/port/keys come from ~/.ssh/config). "
+            "Sessions there appear as host/session in /tmux."
+        ),
+    )
+
     # Reply quoting
     reply_quote: bool = Field(
         True,
@@ -354,6 +364,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=False, extra="ignore"
     )
+
+    @field_validator("tmux_remote_hosts", mode="before")
+    @classmethod
+    def parse_str_list(cls, v: Any) -> Optional[List[str]]:
+        """Parse comma-separated string lists."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            return [h.strip() for h in v.split(",") if h.strip()] or None
+        if isinstance(v, list):
+            return [str(h).strip() for h in v if str(h).strip()] or None
+        return v  # type: ignore[no-any-return]
 
     @field_validator("allowed_users", "notification_chat_ids", mode="before")
     @classmethod

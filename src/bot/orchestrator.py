@@ -9,6 +9,8 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -33,16 +35,19 @@ from telegram.ext import (
 from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .features.claude_jsonl import (
-    claude_project_dir,
     is_interactive_prompt,
     parse_menu,
     prompt_signature,
     render_record,
-    resolve_session_file,
     user_prompt_text,
 )
-from .features.tmux_bridge import TmuxBridge
-from .features.tmux_bridge import list_sessions as tmux_list_sessions
+from .features.tmux_bridge import (
+    HostFS,
+    TmuxBridge,
+    configure_remote_hosts,
+    split_host,
+)
+from .features.tmux_bridge import list_all_sessions as tmux_list_all_sessions
 from .features.usage_render import render_usage
 from .utils.html_format import escape_html
 
@@ -240,6 +245,8 @@ class MessageOrchestrator:
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        # Remote tmux hosts (host/session targets) the bridge may drive.
+        configure_remote_hosts(settings.tmux_remote_hosts)
         self._known_commands: frozenset[str] = frozenset()
         # chat_id -> background task tailing a Claude session .jsonl into the chat
         self._jsonl_mirrors: Dict[int, "asyncio.Task[None]"] = {}
@@ -296,15 +303,18 @@ class MessageOrchestrator:
                 bridge = self._tmux(b["target"])
                 ok, _ = await bridge.available()
                 cwd = await bridge.pane_cwd() if ok else None
+                fs = HostFS(bridge.host)
+                proj_dir = await fs.project_dir(cwd) if cwd else None
             except Exception:
                 cwd = None
-            if cwd:
+                proj_dir = None
+            if cwd and proj_dir:
                 self._start_jsonl_mirror(
                     chat_id,
                     bot,
                     b["target"],
-                    claude_project_dir(Path(cwd)),
-                    resolve_session_file(Path(cwd)),
+                    proj_dir,
+                    await fs.newest_jsonl(proj_dir),
                 )
                 logger.info(
                     "Restored tmux mirror", chat_id=chat_id, target=b["target"]
@@ -1238,21 +1248,28 @@ class MessageOrchestrator:
 
     async def _tmux_session_keyboard(
         self, current: Optional[str]
-    ) -> Optional[InlineKeyboardMarkup]:
-        """Build an inline 'tabs' keyboard of every live tmux session."""
-        sessions = await tmux_list_sessions()
+    ) -> tuple[Optional[InlineKeyboardMarkup], List[str]]:
+        """Inline 'tabs' keyboard of live tmux sessions on every host.
+
+        Returns (keyboard, unreachable_hosts); keyboard is None when no
+        sessions exist anywhere. Remote sessions show as host/session.
+        """
+        sessions, unreachable = await tmux_list_all_sessions()
         if not sessions:
-            return None
+            return None, unreachable
         rows: List[list] = []  # type: ignore[type-arg]
         for s in sessions:
             name = str(s["name"])
+            data = f"tmuxsel:{name}"
+            if len(data.encode()) > 64:  # Telegram callback_data cap
+                continue
             mark = "🟢 " if name == current else "▫️ "
             att = " ·live" if s["attached"] else ""
             label = f"{mark}{name} ({s['windows']}w{att})"
-            rows.append([InlineKeyboardButton(label, callback_data=f"tmuxsel:{name}")])
+            rows.append([InlineKeyboardButton(label, callback_data=data)])
         if current:
             rows.append([InlineKeyboardButton("🔌 Unbind", callback_data="tmuxoff")])
-        return InlineKeyboardMarkup(rows)
+        return InlineKeyboardMarkup(rows), unreachable
 
     async def _bind_and_snapshot(
         self,
@@ -1274,18 +1291,21 @@ class MessageOrchestrator:
         bridge = self._tmux(target)
         cwd = await bridge.pane_cwd()
         cmd = await bridge.pane_command()
-        session_file = resolve_session_file(Path(cwd)) if cwd else None
+        # Session logs live on the host the pane runs on (local or remote).
+        fs = HostFS(bridge.host)
+        proj_dir = await fs.project_dir(cwd) if cwd else None
+        session_file = await fs.newest_jsonl(proj_dir)
         # A pane running `claude` is a mirror target even before its first
         # prompt (no .jsonl yet) -- the loop waits for the log to appear.
         is_claude = bool(session_file) or (cmd or "").lower() == "claude"
 
-        if is_claude and cwd:
+        if is_claude and cwd and proj_dir:
             self._set_binding(chat_id, target, "mirror")
             self._start_jsonl_mirror(
                 chat_id,
                 context.bot,
                 target,
-                claude_project_dir(Path(cwd)),
+                proj_dir,
                 session_file,
             )
             mode_line = (
@@ -1428,9 +1448,25 @@ class MessageOrchestrator:
         cwd, then inject the path into the session and edit the reply."""
         chat_id = update.effective_chat.id
         target = binding["target"]
+        host = split_host(target)[0]
         try:
             tg_file = await media.get_file()
-            await self._stage_file(tg_file, dest)
+            if host:
+                # Remote pane: stage locally (hardlink when possible), then
+                # scp into the pane's cwd on its host, then drop the staging.
+                tmpdir = tempfile.mkdtemp(prefix="tbot-push-")
+                tmp = Path(tmpdir) / safe
+                try:
+                    await self._stage_file(tg_file, tmp)
+                    ok, detail = await self._tmux(target).push_file(
+                        str(tmp), str(dest)
+                    )
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+                if not ok:
+                    raise RuntimeError(f"scp to {host} failed: {detail}")
+            else:
+                await self._stage_file(tg_file, dest)
         except Exception as e:
             logger.warning("tmux file receive failed", error=str(e), file=safe)
             if "too big" in str(e).lower():
@@ -1567,13 +1603,23 @@ class MessageOrchestrator:
         chat_id: int,
         bot: Any,
         target: str,
-        proj_dir: Path,
-        session_file: Optional[Path] = None,
+        proj_dir: Any,
+        session_file: Optional[Any] = None,
     ) -> None:
-        """(Re)start the background tailer streaming a session .jsonl to a chat."""
+        """(Re)start the background tailer streaming a session .jsonl to a chat.
+
+        ``proj_dir``/``session_file`` are path strings on the target's host
+        (local paths for bare targets, remote paths for host/session ones).
+        """
         self._stop_jsonl_mirror(chat_id)
         self._jsonl_mirrors[chat_id] = asyncio.create_task(
-            self._jsonl_mirror_loop(chat_id, bot, target, proj_dir, session_file)
+            self._jsonl_mirror_loop(
+                chat_id,
+                bot,
+                target,
+                str(proj_dir),
+                str(session_file) if session_file else None,
+            )
         )
 
     def _stop_jsonl_mirror(self, chat_id: int) -> None:
@@ -1741,8 +1787,8 @@ class MessageOrchestrator:
         chat_id: int,
         bot: Any,
         target: str,
-        proj_dir: Path,
-        session_file: Optional[Path] = None,
+        proj_dir: str,
+        session_file: Optional[str] = None,
     ) -> None:
         """Tail a Claude session .jsonl and push each new record to the chat.
 
@@ -1750,20 +1796,18 @@ class MessageOrchestrator:
         appear and streams it from the start. An existing log is tailed from
         EOF (only new events from bind onward). Follows the newest file in the
         project dir so a /clear (new session file) is picked up, and resets on
-        truncation.
+        truncation. For host/session targets all file access runs over ssh
+        (HostFS) against the remote's own session store.
 
         Also watches the pane screen for interactive prompts (menus, permission
         requests) -- those are drawn by the TUI and never hit the .jsonl, so
         they'd otherwise be invisible.
         """
         import json as _json
-        from .features.claude_jsonl import _newest_jsonl
 
+        fs = HostFS(split_host(target)[0])
         current = session_file
-        try:
-            offset = current.stat().st_size if current else 0
-        except OSError:
-            offset = 0
+        offset = (await fs.size(current) or 0) if current else 0
         buf = ""
         poll = 0
         last_prompt: Optional[str] = None
@@ -1780,26 +1824,26 @@ class MessageOrchestrator:
 
                 # Waiting for the first log, or following a new one (/clear).
                 if current is None:
-                    current = _newest_jsonl(proj_dir)
+                    current = await fs.newest_jsonl(proj_dir)
                     if current is None:
                         continue
                     offset, buf = 0, ""  # brand-new session: stream from start
                 elif poll % 5 == 0:
-                    newest = _newest_jsonl(proj_dir)
+                    newest = await fs.newest_jsonl(proj_dir)
                     if newest and newest != current:
                         current, offset, buf = newest, 0, ""
-                try:
-                    size = current.stat().st_size
-                except OSError:
+                size = await fs.size(current)
+                if size is None:
                     continue
                 if size < offset:  # truncated/rotated
                     offset, buf = 0, ""
                 if size == offset:
                     continue
-                with current.open("r", encoding="utf-8", errors="replace") as f:
-                    f.seek(offset)
-                    buf += f.read()
-                    offset = f.tell()
+                chunk, nbytes = await fs.read_from(current, offset)
+                if not nbytes:
+                    continue
+                offset += nbytes
+                buf += chunk
                 lines = buf.split("\n")
                 buf = lines.pop()  # keep the incomplete trailing line
                 for ln in lines:
@@ -1852,11 +1896,17 @@ class MessageOrchestrator:
 
         # No args -> show the tab picker.
         await self._audit_tmux(update, context, "list")
-        kb = await self._tmux_session_keyboard(current)
+        kb, unreachable = await self._tmux_session_keyboard(current)
+        warn = (
+            "\n⚠️ unreachable: "
+            + ", ".join(f"<code>{escape_html(h)}</code>" for h in unreachable)
+            if unreachable
+            else ""
+        )
         if kb is None:
             await update.message.reply_text(
                 "No live tmux sessions. On the PC, start one, e.g.:\n"
-                "<code>tmux new -s claude claude</code>",
+                f"<code>tmux new -s claude claude</code>{warn}",
                 parse_mode="HTML",
             )
             return
@@ -1864,7 +1914,8 @@ class MessageOrchestrator:
             f"<code>{escape_html(current)}</code>" if current else "none"
         )
         await update.message.reply_text(
-            f"🖥 <b>tmux sessions</b> — bound: {bound}\nTap a tab to switch:",
+            f"🖥 <b>tmux sessions</b> — bound: {bound}{warn}\n"
+            "Tap a tab to switch:",
             reply_markup=kb,
             parse_mode="HTML",
         )
