@@ -343,25 +343,15 @@ class MessageOrchestrator:
                     proj_dir,
                     await fs.newest_jsonl(proj_dir),
                 )
+                # Silent reconnect -- with one topic per session a per-mirror
+                # "reconnected" chat message means N pings per restart. Log
+                # only; the resumed stream itself is the visible signal.
                 logger.info(
                     "Restored tmux mirror",
                     chat_id=bkey[0],
                     thread_id=bkey[1],
                     target=b["target"],
                 )
-                try:
-                    await bot.send_message(
-                        chat_id=bkey[0],
-                        message_thread_id=bkey[1],
-                        text=(
-                            "🔄 Reconnected live mirror to "
-                            f"<code>{escape_html(b['target'])}</code> "
-                            "after a restart."
-                        ),
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
             else:
                 # Session/pane gone -> drop the stale binding.
                 self._clear_binding(bkey)
