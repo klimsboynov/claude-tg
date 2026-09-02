@@ -66,6 +66,28 @@ _VOLATILE_LINE = re.compile(
 )
 
 
+def is_question_widget(screen: str) -> bool:
+    """True if the pane shows Claude Code's multi-question widget
+    (AskUserQuestion): tabbed questions, checkbox options, a Review/Submit
+    step. Its chrome carries none of the classic menu markers, and digit+Enter
+    handling would mis-answer tabs -- so it gets a key-remote UI instead.
+
+    Only the footer region is inspected (scrollback prose that merely quotes
+    the marker phrases must not trip it), and a visible input box means the
+    widget is closed.
+    """
+    tail = [ln for ln in screen.splitlines() if ln.strip()][-18:]
+    joined = "\n".join(tail)
+    low = joined.lower()
+    if any(m in low for m in _INPUT_FOOTER):
+        return False
+    # Tab strip: arrows plus checkbox/submit glyphs on one line.
+    for ln in tail:
+        if "←" in ln and "→" in ln and any(g in ln for g in ("☒", "☐", "✔")):
+            return True
+    return "review your answers" in low or "ready to submit" in low
+
+
 def is_interactive_prompt(screen: str) -> bool:
     """True if the pane snapshot looks like a menu/permission prompt awaiting input.
 

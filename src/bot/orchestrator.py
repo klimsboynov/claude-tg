@@ -36,6 +36,7 @@ from ..config.settings import Settings
 from ..projects import PrivateTopicsUnavailableError
 from .features.claude_jsonl import (
     is_interactive_prompt,
+    is_question_widget,
     parse_menu,
     prompt_signature,
     render_record,
@@ -257,6 +258,10 @@ class MessageOrchestrator:
         self._jsonl_mirrors: Dict[BindingKey, "asyncio.Task[None]"] = {}
         # bkey -> recently phone-sent prompts, to suppress their mirror echo
         self._mirror_echo: Dict[BindingKey, List[str]] = {}
+        # bkey -> signature of the interactive prompt already surfaced, shared
+        # between the mirror watcher and the widget-remote key callbacks so a
+        # phone keypress editing the snapshot doesn't get re-posted as new.
+        self._last_prompt: Dict[BindingKey, Optional[str]] = {}
         # bkey -> {"target": str, "mode": "mirror"|"snapshot"}, persisted so
         # tmux bindings + live mirrors survive a bot restart.
         self._bindings: Dict[BindingKey, Dict[str, str]] = self._load_bindings()
@@ -649,6 +654,12 @@ class MessageOrchestrator:
             CallbackQueryHandler(
                 self._inject_deps(self._handle_tmux_option_callback),
                 pattern=r"^tmuxopt:",
+            )
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_tmux_key_callback),
+                pattern=r"^tmuxkey:",
             )
         )
 
@@ -1651,6 +1662,7 @@ class MessageOrchestrator:
         if task and not task.done():
             task.cancel()
         self._mirror_echo.pop(bkey, None)
+        self._last_prompt.pop(bkey, None)
 
     def _note_echo(self, bkey: BindingKey, text: str) -> None:
         """Record a phone-sent prompt so its mirror echo can be suppressed."""
@@ -1713,7 +1725,8 @@ class MessageOrchestrator:
             screen = await self._tmux(target).capture()
         except Exception:
             return last_prompt
-        if not is_interactive_prompt(screen):
+        widget = is_question_widget(screen)
+        if not widget and not is_interactive_prompt(screen):
             return None
         sig = prompt_signature(screen)
         if sig == last_prompt:
@@ -1730,6 +1743,21 @@ class MessageOrchestrator:
                 await self._tmux(target).send_key("Escape")
             except Exception as e:
                 logger.warning("usage auto-dismiss failed", error=str(e))
+            return sig
+
+        if widget:
+            # Multi-question widget: digits/Enter shortcuts would mis-answer
+            # tabs, so hand the user a key-remote that live-edits its snapshot.
+            try:
+                await bot.send_message(
+                    chat_id=bkey[0],
+                    message_thread_id=bkey[1],
+                    text=self._widget_text(screen),
+                    reply_markup=self._widget_keyboard(),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.warning("widget remote send failed", error=str(e))
             return sig
 
         menu = parse_menu(screen)
@@ -1815,6 +1843,92 @@ class MessageOrchestrator:
             pass
         await query.edit_message_text(f"✅ Selected option {escape_html(choice)}.")
 
+    # Keys the widget remote may press, mapped to tmux send-keys names.
+    _REMOTE_KEYS: Dict[str, str] = {
+        "up": "Up",
+        "down": "Down",
+        "left": "Left",
+        "right": "Right",
+        "space": "Space",
+        "enter": "Enter",
+        "esc": "Escape",
+        "tab": "Tab",
+        **{d: d for d in "123456789"},
+    }
+
+    def _widget_text(self, screen: str) -> str:
+        """Snapshot body for the widget remote (footer region only)."""
+        tail = "\n".join(screen.rstrip().splitlines()[-28:])
+        return (
+            "🎛 <b>Claude is asking (widget)</b> — drive it with the "
+            f"buttons:\n{self._format_pane(tail)}"
+        )
+
+    def _widget_keyboard(self) -> InlineKeyboardMarkup:
+        def btn(label: str, key: str) -> InlineKeyboardButton:
+            return InlineKeyboardButton(label, callback_data=f"tmuxkey:{key}")
+
+        return InlineKeyboardMarkup(
+            [
+                [
+                    btn("⬅️", "left"),
+                    btn("⬆️", "up"),
+                    btn("⬇️", "down"),
+                    btn("➡️", "right"),
+                ],
+                [btn(d, d) for d in "12345"],
+                [
+                    btn("␣ space", "space"),
+                    btn("⏎ enter", "enter"),
+                    btn("⎋ esc", "esc"),
+                ],
+                [btn("🔄 refresh", "refresh")],
+            ]
+        )
+
+    async def _handle_tmux_key_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """tmuxkey:<key> — press a key in the bound pane and live-edit the
+        snapshot message, turning the phone into a TUI remote."""
+        query = update.callback_query
+        await query.answer()
+        key = (query.data or "").split(":", 1)[-1]
+
+        bkey = self._bkey(update)
+        b = self._binding(bkey)
+        if not b:
+            await query.edit_message_text("⚠️ Not bound to a session anymore.")
+            return
+        bridge = self._tmux(b["target"])
+        if key != "refresh":
+            tmux_key = self._REMOTE_KEYS.get(key)
+            if not tmux_key:
+                return
+            await bridge.send_key(tmux_key)
+            await asyncio.sleep(0.6)
+        try:
+            screen = await bridge.capture()
+        except Exception:
+            return
+        # Keep the watcher quiet about the state this press produced.
+        self._last_prompt[bkey] = prompt_signature(screen)
+        still_open = is_question_widget(screen) or is_interactive_prompt(screen)
+        try:
+            if still_open:
+                await query.edit_message_text(
+                    self._widget_text(screen),
+                    reply_markup=self._widget_keyboard(),
+                    parse_mode="HTML",
+                )
+            else:
+                await query.edit_message_text(
+                    "✅ Widget closed — back to the session."
+                )
+                self._last_prompt[bkey] = None
+        except Exception:
+            pass  # unchanged screen -> Telegram rejects identical edit
+
     async def _jsonl_mirror_loop(
         self,
         bkey: BindingKey,
@@ -1843,7 +1957,7 @@ class MessageOrchestrator:
         offset = (await fs.size(current) or 0) if current else 0
         buf = ""
         poll = 0
-        last_prompt: Optional[str] = None
+        self._last_prompt[bkey] = None
         try:
             while True:
                 await asyncio.sleep(1.0)
@@ -1851,8 +1965,8 @@ class MessageOrchestrator:
 
                 # Surface interactive TUI prompts (not present in the .jsonl).
                 if poll % 2 == 0:
-                    last_prompt = await self._check_pane_prompt(
-                        bot, bkey, target, last_prompt
+                    self._last_prompt[bkey] = await self._check_pane_prompt(
+                        bot, bkey, target, self._last_prompt.get(bkey)
                     )
 
                 # Waiting for the first log, or following a new one (/clear).
