@@ -14,7 +14,7 @@ import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from telegram import (
@@ -52,6 +52,11 @@ from .features.usage_render import render_usage
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
+
+# Binding key: (chat_id, message_thread_id|None). In a forum supergroup each
+# topic is its own key -- one bound tmux session per topic ("tabs"); a DM (or
+# non-forum group) keys as (chat_id, None) exactly like before.
+BindingKey = Tuple[int, Optional[int]]
 
 
 def _claude_project_dir(directory: Path) -> Path:
@@ -248,13 +253,13 @@ class MessageOrchestrator:
         # Remote tmux hosts (host/session targets) the bridge may drive.
         configure_remote_hosts(settings.tmux_remote_hosts)
         self._known_commands: frozenset[str] = frozenset()
-        # chat_id -> background task tailing a Claude session .jsonl into the chat
-        self._jsonl_mirrors: Dict[int, "asyncio.Task[None]"] = {}
-        # chat_id -> recently phone-sent prompts, to suppress their mirror echo
-        self._mirror_echo: Dict[int, List[str]] = {}
-        # chat_id -> {"target": str, "mode": "mirror"|"snapshot"}, persisted so
+        # bkey -> background task tailing a Claude session .jsonl into the chat
+        self._jsonl_mirrors: Dict[BindingKey, "asyncio.Task[None]"] = {}
+        # bkey -> recently phone-sent prompts, to suppress their mirror echo
+        self._mirror_echo: Dict[BindingKey, List[str]] = {}
+        # bkey -> {"target": str, "mode": "mirror"|"snapshot"}, persisted so
         # tmux bindings + live mirrors survive a bot restart.
-        self._bindings: Dict[int, Dict[str, str]] = self._load_bindings()
+        self._bindings: Dict[BindingKey, Dict[str, str]] = self._load_bindings()
 
     # --- persistent tmux bindings ---
 
@@ -265,10 +270,19 @@ class MessageOrchestrator:
         parent = Path(db).parent if db else Path("data")
         return parent / "tmux_bindings.json"
 
-    def _load_bindings(self) -> Dict[int, Dict[str, str]]:
+    def _load_bindings(self) -> Dict[BindingKey, Dict[str, str]]:
+        """Load bindings; JSON keys are "chat" (legacy, no topic) or
+        "chat:thread" (a forum topic)."""
         try:
             raw = json.loads(self._bindings_path().read_text(encoding="utf-8"))
-            return {int(k): v for k, v in raw.items()}
+            out: Dict[BindingKey, Dict[str, str]] = {}
+            for k, v in raw.items():
+                if ":" in k:
+                    c, t = k.split(":", 1)
+                    out[(int(c), int(t))] = v
+                else:
+                    out[(int(k), None)] = v
+            return out
         except (OSError, ValueError, TypeError):
             return {}
 
@@ -276,27 +290,35 @@ class MessageOrchestrator:
         try:
             path = self._bindings_path()
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps({str(k): v for k, v in self._bindings.items()}),
-                encoding="utf-8",
-            )
+            data = {
+                (f"{c}:{t}" if t is not None else str(c)): v
+                for (c, t), v in self._bindings.items()
+            }
+            path.write_text(json.dumps(data), encoding="utf-8")
         except OSError as e:
             logger.warning("Failed to persist tmux bindings", error=str(e))
 
-    def _binding(self, chat_id: int) -> Optional[Dict[str, str]]:
-        return self._bindings.get(chat_id)
+    def _bkey(self, update: Update) -> BindingKey:
+        """Binding key for this update: (chat_id, topic thread id or None)."""
+        return (
+            update.effective_chat.id,
+            self._extract_message_thread_id(update),
+        )
 
-    def _set_binding(self, chat_id: int, target: str, mode: str) -> None:
-        self._bindings[chat_id] = {"target": target, "mode": mode}
+    def _binding(self, bkey: BindingKey) -> Optional[Dict[str, str]]:
+        return self._bindings.get(bkey)
+
+    def _set_binding(self, bkey: BindingKey, target: str, mode: str) -> None:
+        self._bindings[bkey] = {"target": target, "mode": mode}
         self._save_bindings()
 
-    def _clear_binding(self, chat_id: int) -> None:
-        if self._bindings.pop(chat_id, None) is not None:
+    def _clear_binding(self, bkey: BindingKey) -> None:
+        if self._bindings.pop(bkey, None) is not None:
             self._save_bindings()
 
     async def restore_mirrors(self, bot: Any) -> None:
         """Re-establish live mirrors for persisted bindings after a restart."""
-        for chat_id, b in list(self._bindings.items()):
+        for bkey, b in list(self._bindings.items()):
             if b.get("mode") != "mirror":
                 continue
             try:
@@ -310,18 +332,22 @@ class MessageOrchestrator:
                 proj_dir = None
             if cwd and proj_dir:
                 self._start_jsonl_mirror(
-                    chat_id,
+                    bkey,
                     bot,
                     b["target"],
                     proj_dir,
                     await fs.newest_jsonl(proj_dir),
                 )
                 logger.info(
-                    "Restored tmux mirror", chat_id=chat_id, target=b["target"]
+                    "Restored tmux mirror",
+                    chat_id=bkey[0],
+                    thread_id=bkey[1],
+                    target=b["target"],
                 )
                 try:
                     await bot.send_message(
-                        chat_id=chat_id,
+                        chat_id=bkey[0],
+                        message_thread_id=bkey[1],
                         text=(
                             "🔄 Reconnected live mirror to "
                             f"<code>{escape_html(b['target'])}</code> "
@@ -333,7 +359,7 @@ class MessageOrchestrator:
                     pass
             else:
                 # Session/pane gone -> drop the stale binding.
-                self._clear_binding(chat_id)
+                self._clear_binding(bkey)
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -527,6 +553,7 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("resume", self.agentic_resume),
             ("tmux", self.agentic_tmux),
+            ("sync_tmux", self.agentic_sync_tmux),
             ("peek", self.agentic_peek),
             ("key", self.agentic_key),
             ("stop", self.agentic_stop),
@@ -690,6 +717,7 @@ class MessageOrchestrator:
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("resume", "Pick a session to resume"),
                 BotCommand("tmux", "Pick/switch a live tmux session (tabs)"),
+                BotCommand("sync_tmux", "Forum group: one topic per session"),
                 BotCommand("peek", "Snapshot the bound tmux pane"),
                 BotCommand("key", "Send a key to the bound pane (esc/y/c-c…)"),
                 # Passthrough commands: no bot handler — forwarded into the bound
@@ -873,7 +901,7 @@ class MessageOrchestrator:
                 return
 
         # tmux is the only path: route to the bound session, else ask to bind.
-        if self._binding(update.effective_chat.id):
+        if self._binding(self._bkey(update)):
             await self._tmux_send_and_report(update, context, message_text)
         else:
             await self._prompt_bind(update)
@@ -883,7 +911,7 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Deliver an uploaded file into the bound tmux session's cwd."""
-        binding = self._binding(update.effective_chat.id)
+        binding = self._binding(self._bkey(update))
         if not binding:
             await self._prompt_bind(update)
             return
@@ -894,7 +922,7 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Deliver a photo into the bound tmux session's cwd."""
-        binding = self._binding(update.effective_chat.id)
+        binding = self._binding(self._bkey(update))
         if not binding:
             await self._prompt_bind(update)
             return
@@ -905,7 +933,7 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Deliver a video / animation / video-note into the bound session's cwd."""
-        binding = self._binding(update.effective_chat.id)
+        binding = self._binding(self._bkey(update))
         if not binding:
             await self._prompt_bind(update)
             return
@@ -916,7 +944,7 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Transcribe a voice message and route the text into the bound session."""
-        binding = self._binding(update.effective_chat.id)
+        binding = self._binding(self._bkey(update))
         if not binding:
             await self._prompt_bind(update)
             return
@@ -1178,8 +1206,8 @@ class MessageOrchestrator:
     ) -> None:
         """Interrupt the bound session's current turn (Esc for Claude, Ctrl-C
         for a plain shell)."""
-        chat_id = update.effective_chat.id
-        binding = self._binding(chat_id)
+        bkey = self._bkey(update)
+        binding = self._binding(bkey)
 
         audit_logger = context.bot_data.get("audit_logger")
         if audit_logger:
@@ -1197,8 +1225,8 @@ class MessageOrchestrator:
         bridge = self._tmux(target)
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(chat_id)
-            self._stop_jsonl_mirror(chat_id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await update.message.reply_text(
                 f"⚠️ {escape_html(detail)}", parse_mode="HTML"
             )
@@ -1271,23 +1299,14 @@ class MessageOrchestrator:
             rows.append([InlineKeyboardButton("🔌 Unbind", callback_data="tmuxoff")])
         return InlineKeyboardMarkup(rows), unreachable
 
-    async def _bind_and_snapshot(
-        self,
-        update: Update,
-        context: ContextTypes.DEFAULT_TYPE,
-        target: str,
-        *,
-        edit: bool = False,
-    ) -> None:
-        """Bind the chat to a tmux session.
+    async def _bind_session(self, bot: Any, bkey: BindingKey, target: str) -> str:
+        """Bind ``bkey`` (chat or forum topic) to a tmux session.
 
-        If the pane is running a Claude session, start a live jsonl mirror that
-        streams its messages here. Otherwise fall back to snapshot mode.
+        If the pane is running a Claude session, starts a live jsonl mirror
+        streaming into that chat/topic; otherwise snapshot mode. Returns the
+        human-readable mode line.
         """
-        chat_id = update.effective_chat.id
-        self._stop_jsonl_mirror(chat_id)
-        await self._audit_tmux(update, context, f"bind:{target}")
-
+        self._stop_jsonl_mirror(bkey)
         bridge = self._tmux(target)
         cwd = await bridge.pane_cwd()
         cmd = await bridge.pane_command()
@@ -1300,24 +1319,28 @@ class MessageOrchestrator:
         is_claude = bool(session_file) or (cmd or "").lower() == "claude"
 
         if is_claude and cwd and proj_dir:
-            self._set_binding(chat_id, target, "mirror")
-            self._start_jsonl_mirror(
-                chat_id,
-                context.bot,
-                target,
-                proj_dir,
-                session_file,
-            )
-            mode_line = (
+            self._set_binding(bkey, target, "mirror")
+            self._start_jsonl_mirror(bkey, bot, target, proj_dir, session_file)
+            return (
                 "🪞 <b>live mirror</b> on — I'll stream Claude's replies and "
                 "tool calls here as they happen."
             )
-        else:
-            self._set_binding(chat_id, target, "snapshot")
-            mode_line = (
-                "📸 snapshot mode (not a Claude session) — /peek to refresh."
-            )
+        self._set_binding(bkey, target, "snapshot")
+        return "📸 snapshot mode (not a Claude session) — /peek to refresh."
 
+    async def _bind_and_snapshot(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        target: str,
+        *,
+        edit: bool = False,
+    ) -> None:
+        """Bind the chat/topic to a tmux session and reply with a snapshot."""
+        bkey = self._bkey(update)
+        await self._audit_tmux(update, context, f"bind:{target}")
+        bridge = self._tmux(target)
+        mode_line = await self._bind_session(context.bot, bkey, target)
         snapshot = await bridge.capture()
         text = (
             f"🔗 Bound to <code>{escape_html(target)}</code>. {mode_line}\n"
@@ -1341,8 +1364,8 @@ class MessageOrchestrator:
         type and return (claude queues input typed while it's busy). In
         snapshot mode we type and reply with a settled screen capture.
         """
-        chat_id = update.effective_chat.id
-        binding = self._binding(chat_id)
+        bkey = self._bkey(update)
+        binding = self._binding(bkey)
         if not binding:
             return
         target = binding["target"]
@@ -1350,8 +1373,8 @@ class MessageOrchestrator:
         bridge = self._tmux(target)
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(chat_id)
-            self._stop_jsonl_mirror(chat_id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await update.message.reply_text(
                 f"⚠️ Session <code>{escape_html(target)}</code> is gone: "
                 f"{escape_html(detail)}\nUnbound — /tmux to pick another.",
@@ -1363,7 +1386,7 @@ class MessageOrchestrator:
         if mode == "mirror":
             # Remember what we typed so the mirror doesn't echo it back at us
             # (we already see it in the chat); PC-typed turns still echo.
-            self._note_echo(chat_id, text)
+            self._note_echo(bkey, text)
         await bridge.send_text(text)
         await self._audit_tmux(update, context, f"send:{target}")
 
@@ -1400,13 +1423,13 @@ class MessageOrchestrator:
         freeze every other message. An immediate "receiving" reply is edited
         in place to the final result.
         """
-        chat_id = update.effective_chat.id
+        bkey = self._bkey(update)
         target = binding["target"]
         bridge = self._tmux(target)
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(chat_id)
-            self._stop_jsonl_mirror(chat_id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await update.message.reply_text(
                 f"⚠️ {escape_html(detail)}", parse_mode="HTML"
             )
@@ -1446,7 +1469,7 @@ class MessageOrchestrator:
     ) -> None:
         """Background worker: pull the file, hardlink/copy it into the pane's
         cwd, then inject the path into the session and edit the reply."""
-        chat_id = update.effective_chat.id
+        bkey = self._bkey(update)
         target = binding["target"]
         host = split_host(target)[0]
         try:
@@ -1486,7 +1509,7 @@ class MessageOrchestrator:
         note = f"[uploaded file saved to: {dest}]"
         typed = f"{flat} {note}".strip() if flat else note
         if binding.get("mode") == "mirror":
-            self._note_echo(chat_id, typed)
+            self._note_echo(bkey, typed)
         try:
             await self._tmux(target).send_text(typed)
             await self._audit_tmux(update, context, f"file:{target}")
@@ -1600,21 +1623,22 @@ class MessageOrchestrator:
 
     def _start_jsonl_mirror(
         self,
-        chat_id: int,
+        bkey: BindingKey,
         bot: Any,
         target: str,
         proj_dir: Any,
         session_file: Optional[Any] = None,
     ) -> None:
-        """(Re)start the background tailer streaming a session .jsonl to a chat.
+        """(Re)start the background tailer streaming a session .jsonl to a
+        chat/topic.
 
         ``proj_dir``/``session_file`` are path strings on the target's host
         (local paths for bare targets, remote paths for host/session ones).
         """
-        self._stop_jsonl_mirror(chat_id)
-        self._jsonl_mirrors[chat_id] = asyncio.create_task(
+        self._stop_jsonl_mirror(bkey)
+        self._jsonl_mirrors[bkey] = asyncio.create_task(
             self._jsonl_mirror_loop(
-                chat_id,
+                bkey,
                 bot,
                 target,
                 str(proj_dir),
@@ -1622,21 +1646,21 @@ class MessageOrchestrator:
             )
         )
 
-    def _stop_jsonl_mirror(self, chat_id: int) -> None:
-        task = self._jsonl_mirrors.pop(chat_id, None)
+    def _stop_jsonl_mirror(self, bkey: BindingKey) -> None:
+        task = self._jsonl_mirrors.pop(bkey, None)
         if task and not task.done():
             task.cancel()
-        self._mirror_echo.pop(chat_id, None)
+        self._mirror_echo.pop(bkey, None)
 
-    def _note_echo(self, chat_id: int, text: str) -> None:
+    def _note_echo(self, bkey: BindingKey, text: str) -> None:
         """Record a phone-sent prompt so its mirror echo can be suppressed."""
-        lst = self._mirror_echo.setdefault(chat_id, [])
+        lst = self._mirror_echo.setdefault(bkey, [])
         lst.append(text.strip())
         del lst[:-10]  # keep only the last few
 
-    def _consume_echo(self, chat_id: int, text: str) -> bool:
+    def _consume_echo(self, bkey: BindingKey, text: str) -> bool:
         """True if ``text`` matches a pending phone-sent prompt (and removes it)."""
-        lst = self._mirror_echo.get(chat_id)
+        lst = self._mirror_echo.get(bkey)
         if not lst:
             return False
         t = text.strip()
@@ -1656,21 +1680,29 @@ class MessageOrchestrator:
         return out
 
     async def _mirror_send(
-        self, bot: Any, chat_id: int, text: str, mode: Optional[str]
+        self, bot: Any, bkey: BindingKey, text: str, mode: Optional[str]
     ) -> None:
         """Deliver one rendered event, falling back to plain text on HTML error."""
+        chat_id, thread_id = bkey
         for chunk in self._split_message(text):
             try:
-                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode=mode)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    text=chunk,
+                    parse_mode=mode,
+                )
             except Exception:
                 try:
-                    await bot.send_message(chat_id=chat_id, text=chunk)
+                    await bot.send_message(
+                        chat_id=chat_id, message_thread_id=thread_id, text=chunk
+                    )
                 except Exception as e:
                     logger.warning("mirror send failed", chat_id=chat_id, error=str(e))
             await asyncio.sleep(0.4)  # gentle per-chat rate limit
 
     async def _check_pane_prompt(
-        self, bot: Any, chat_id: int, target: str, last_prompt: Optional[str]
+        self, bot: Any, bkey: BindingKey, target: str, last_prompt: Optional[str]
     ) -> Optional[str]:
         """Push an interactive TUI prompt to the chat if one is waiting.
 
@@ -1693,7 +1725,7 @@ class MessageOrchestrator:
         # user's next message. Return sig so a lingering frame won't re-post.
         card = render_usage(screen)
         if card:
-            await self._mirror_send(bot, chat_id, card, "HTML")
+            await self._mirror_send(bot, bkey, card, "HTML")
             try:
                 await self._tmux(target).send_key("Escape")
             except Exception as e:
@@ -1723,18 +1755,19 @@ class MessageOrchestrator:
             body = "\n".join(body_lines)
             try:
                 await bot.send_message(
-                    chat_id=chat_id,
+                    chat_id=bkey[0],
+                    message_thread_id=bkey[1],
                     text=f"⌨️ <b>{escape_html(menu['title'])}</b>\n\n{body}",
                     reply_markup=InlineKeyboardMarkup(rows),
                     parse_mode="HTML",
                 )
             except Exception as e:
-                logger.warning("menu send failed", chat_id=chat_id, error=str(e))
+                logger.warning("menu send failed", chat_id=bkey[0], error=str(e))
         else:
             # Free-form prompt (no clean numbered options) -> snapshot + hint.
             await self._mirror_send(
                 bot,
-                chat_id,
+                bkey,
                 "⌨️ <b>Claude needs your input:</b>\n"
                 + self._format_pane(screen)
                 + "\nReply, or /key Up · /key Down · /key Enter.",
@@ -1750,17 +1783,17 @@ class MessageOrchestrator:
         await query.answer()
         data = query.data or ""
         choice = data.split(":", 1)[1] if ":" in data else ""
-        chat_id = update.effective_chat.id
 
-        b = self._binding(chat_id)
+        bkey = self._bkey(update)
+        b = self._binding(bkey)
         if not b:
             await query.edit_message_text("⚠️ Not bound to a session anymore.")
             return
         bridge = self._tmux(b["target"])
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(chat_id)
-            self._stop_jsonl_mirror(chat_id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await query.edit_message_text(
                 f"⚠️ {escape_html(detail)}", parse_mode="HTML"
             )
@@ -1784,7 +1817,7 @@ class MessageOrchestrator:
 
     async def _jsonl_mirror_loop(
         self,
-        chat_id: int,
+        bkey: BindingKey,
         bot: Any,
         target: str,
         proj_dir: str,
@@ -1819,7 +1852,7 @@ class MessageOrchestrator:
                 # Surface interactive TUI prompts (not present in the .jsonl).
                 if poll % 2 == 0:
                     last_prompt = await self._check_pane_prompt(
-                        bot, chat_id, target, last_prompt
+                        bot, bkey, target, last_prompt
                     )
 
                 # Waiting for the first log, or following a new one (/clear).
@@ -1846,6 +1879,10 @@ class MessageOrchestrator:
                 buf += chunk
                 lines = buf.split("\n")
                 buf = lines.pop()  # keep the incomplete trailing line
+                # Coalesce runs of consecutive tool one-liners from this chunk
+                # into single messages -- tool calls are the volume driver, and
+                # in a forum group every topic shares one ~20 msg/min budget.
+                tools: List[str] = []
                 for ln in lines:
                     ln = ln.strip()
                     if not ln:
@@ -1856,31 +1893,52 @@ class MessageOrchestrator:
                         continue
                     # Suppress echoing prompts we sent from this chat.
                     raw = user_prompt_text(obj)
-                    if raw is not None and self._consume_echo(chat_id, raw):
+                    if raw is not None and self._consume_echo(bkey, raw):
                         continue
                     rendered = render_record(obj)
-                    if rendered:
-                        await self._mirror_send(bot, chat_id, rendered[0], rendered[1])
+                    if not rendered:
+                        continue
+                    text, mode, kind = rendered
+                    if kind == "tool":
+                        if tools and (
+                            sum(len(t) + 1 for t in tools) + len(text) > 3400
+                        ):
+                            await self._mirror_send(
+                                bot, bkey, "\n".join(tools), "HTML"
+                            )
+                            tools = []
+                        tools.append(text)
+                        continue
+                    if tools:
+                        await self._mirror_send(bot, bkey, "\n".join(tools), "HTML")
+                        tools = []
+                    await self._mirror_send(bot, bkey, text, mode)
+                if tools:
+                    await self._mirror_send(bot, bkey, "\n".join(tools), "HTML")
         except asyncio.CancelledError:
             pass
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("jsonl mirror loop crashed", chat_id=chat_id, error=str(e))
+            logger.warning(
+                "jsonl mirror loop crashed",
+                chat_id=bkey[0],
+                thread_id=bkey[1],
+                error=str(e),
+            )
 
     async def agentic_tmux(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Bind chat to a tmux session: /tmux [name|off]. No arg = tab picker."""
         args = update.message.text.split()[1:] if update.message.text else []
-        b = self._binding(update.effective_chat.id)
+        bkey = self._bkey(update)
+        b = self._binding(bkey)
         current = b["target"] if b else None
 
         if args and args[0].lower() == "off":
-            self._clear_binding(update.effective_chat.id)
-            self._stop_jsonl_mirror(update.effective_chat.id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await self._audit_tmux(update, context, "off")
-            await update.message.reply_text(
-                "🔌 Unbound. Messages go to headless Claude again."
-            )
+            await update.message.reply_text("🔌 Unbound this chat/topic.")
             return
 
         if args:
@@ -1929,12 +1987,11 @@ class MessageOrchestrator:
         data = query.data or ""
 
         if data == "tmuxoff":
-            self._clear_binding(update.effective_chat.id)
-            self._stop_jsonl_mirror(update.effective_chat.id)
+            bkey = self._bkey(update)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await self._audit_tmux(update, context, "off")
-            await query.edit_message_text(
-                "🔌 Unbound. Messages go to headless Claude again."
-            )
+            await query.edit_message_text("🔌 Unbound this chat/topic.")
             return
 
         target = data.split(":", 1)[1] if ":" in data else ""
@@ -1948,11 +2005,106 @@ class MessageOrchestrator:
             return
         await self._bind_and_snapshot(update, context, target, edit=True)
 
+    async def agentic_sync_tmux(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """One forum topic per live tmux session (all hosts): /sync_tmux.
+
+        Run inside a supergroup with Topics enabled (bot needs Manage Topics).
+        Creates+binds a topic for every session that doesn't have one here,
+        and closes topics whose session died. Idempotent -- run it any time.
+        """
+        chat = update.effective_chat
+        await self._audit_tmux(update, context, "sync_tmux")
+        if not getattr(chat, "is_forum", False):
+            await update.message.reply_text(
+                "This needs a supergroup with <b>Topics</b> enabled (and me as "
+                "admin with <i>Manage Topics</i>). Run /sync_tmux there.",
+                parse_mode="HTML",
+            )
+            return
+
+        sessions, unreachable = await tmux_list_all_sessions()
+        names = {str(s["name"]) for s in sessions}
+        # Existing topic bindings in THIS chat: target -> bkey.
+        bound = {
+            v["target"]: k
+            for k, v in self._bindings.items()
+            if k[0] == chat.id and k[1] is not None
+        }
+        pace = float(
+            getattr(
+                self.settings,
+                "project_threads_sync_action_interval_seconds",
+                1.1,
+            )
+            or 0
+        )
+        created, closed, failed = [], [], []
+
+        for name in sorted(names - set(bound)):
+            try:
+                topic = await context.bot.create_forum_topic(
+                    chat_id=chat.id, name=name[:120]
+                )
+            except Exception as e:
+                logger.warning("topic create failed", name=name, error=str(e))
+                failed.append(name)
+                continue
+            bkey = (chat.id, topic.message_thread_id)
+            mode_line = await self._bind_session(context.bot, bkey, name)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    message_thread_id=topic.message_thread_id,
+                    text=(
+                        f"🔗 <code>{escape_html(name)}</code> — {mode_line}\n"
+                        "Type here to drive it · /peek · /key · /stop."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+            created.append(name)
+            if pace:
+                await asyncio.sleep(pace)
+
+        for name, bkey in sorted(bound.items()):
+            if name in names:
+                continue
+            self._stop_jsonl_mirror(bkey)
+            self._clear_binding(bkey)
+            try:
+                await context.bot.send_message(
+                    chat_id=bkey[0],
+                    message_thread_id=bkey[1],
+                    text="💀 Session is gone — closing this topic.",
+                )
+                await context.bot.close_forum_topic(
+                    chat_id=bkey[0], message_thread_id=bkey[1]
+                )
+            except Exception as e:
+                logger.warning("topic close failed", name=name, error=str(e))
+            closed.append(name)
+            if pace:
+                await asyncio.sleep(pace)
+
+        kept = len(bound) - len(closed)
+        parts = [f"🗂 topics: +{len(created)} created, {kept} kept"]
+        if closed:
+            parts.append(f"{len(closed)} closed ({', '.join(closed[:5])})")
+        if failed:
+            parts.append(f"⚠️ failed: {', '.join(failed[:5])}")
+        if unreachable:
+            parts.append(f"⚠️ unreachable hosts: {', '.join(unreachable)}")
+        await update.message.reply_text(" · ".join(parts))
+
     async def agentic_peek(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Snapshot the bound tmux session: /peek [scrollback_lines]."""
-        b = self._binding(update.effective_chat.id)
+        bkey = self._bkey(update)
+        b = self._binding(bkey)
         if not b:
             await update.message.reply_text(
                 "Not bound to a session. Use /tmux to pick one."
@@ -1971,8 +2123,8 @@ class MessageOrchestrator:
         bridge = self._tmux(target)
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(update.effective_chat.id)
-            self._stop_jsonl_mirror(update.effective_chat.id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await update.message.reply_text(
                 f"⚠️ {escape_html(detail)}", parse_mode="HTML"
             )
@@ -1988,7 +2140,8 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Send a named key to the bound session: /key <name> (esc, y, c-c, up)."""
-        b = self._binding(update.effective_chat.id)
+        bkey = self._bkey(update)
+        b = self._binding(bkey)
         if not b:
             await update.message.reply_text(
                 "Not bound to a session. Use /tmux to pick one."
@@ -2009,8 +2162,8 @@ class MessageOrchestrator:
         bridge = self._tmux(target)
         ok, detail = await bridge.available()
         if not ok:
-            self._clear_binding(update.effective_chat.id)
-            self._stop_jsonl_mirror(update.effective_chat.id)
+            self._clear_binding(bkey)
+            self._stop_jsonl_mirror(bkey)
             await update.message.reply_text(
                 f"⚠️ {escape_html(detail)}", parse_mode="HTML"
             )

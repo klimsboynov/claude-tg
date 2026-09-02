@@ -100,6 +100,8 @@ Security relaxation (trusted environments only): `DISABLE_SECURITY_PATTERNS` (de
 
 Multi-server tmux: `TMUX_REMOTE_HOSTS` (comma-separated SSH host aliases; auth via `~/.ssh/config`). Remote sessions appear in `/tmux` as `host/session`; the bridge runs tmux over multiplexed SSH, tails the remote Claude session jsonl for live mirror, and delivers file uploads via scp into the remote pane cwd.
 
+Sessions-as-topics: tmux bindings are keyed `(chat_id, message_thread_id)`, so in a forum supergroup each topic binds its own session (parallel mirrors, per-topic uploads/menus); DMs key as `(chat_id, None)` unchanged (bindings JSON: `"chat"` legacy / `"chat:thread"`). `/sync_tmux` in a forum group (bot admin + Manage Topics) creates/binds one topic per live session across all hosts and closes topics for dead sessions. Mirror coalesces consecutive tool one-liners per read chunk to respect the ~20 msg/min per-group budget. Don't combine with `ENABLE_PROJECT_THREADS` routing in the same group.
+
 Multi-project topics: `ENABLE_PROJECT_THREADS` (default false), `PROJECT_THREADS_MODE` (`private`|`group`), `PROJECT_THREADS_CHAT_ID` (required for group mode), `PROJECTS_CONFIG_PATH` (path to YAML project registry), `PROJECT_THREADS_SYNC_ACTION_INTERVAL_SECONDS` (default `1.1`, set `0` to disable pacing). See `config/projects.example.yaml`.
 
 Output verbosity: `VERBOSE_LEVEL` (default 1, range 0-2). Controls how much of Claude's background activity is shown to the user in real-time. 0 = quiet (only final response, typing indicator still active), 1 = normal (tool names + reasoning snippets shown during execution), 2 = detailed (tool names with input summaries + longer reasoning text). Users can override per-session via `/verbose 0|1|2`. A persistent typing indicator is refreshed every ~2 seconds at all levels.
@@ -124,7 +126,7 @@ All datetimes use timezone-aware UTC: `datetime.now(UTC)` (not `datetime.utcnow(
 
 ### Agentic mode
 
-Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENABLE_PROJECT_THREADS=true`: `/sync_threads`. To add a new command:
+Agentic mode commands: `/start`, `/new`, `/status`, `/repo`, `/resume`, `/tmux`, `/sync_tmux`, `/peek`, `/key`, `/stop`, `/clear`, `/restart`. If `ENABLE_PROJECT_THREADS=true`: `/sync_threads`. To add a new command:
 
 1. Add handler function in `src/bot/orchestrator.py`
 2. Register in `MessageOrchestrator._register_agentic_handlers()`

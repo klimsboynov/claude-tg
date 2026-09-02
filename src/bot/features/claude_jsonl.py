@@ -268,11 +268,14 @@ def render_record(
     obj: dict,  # type: ignore[type-arg]
     *,
     show_tools: bool = True,
-) -> Optional[Tuple[str, Optional[str]]]:
-    """Turn one jsonl record into (text, parse_mode), or None to skip.
+) -> Optional[Tuple[str, Optional[str], str]]:
+    """Turn one jsonl record into (text, parse_mode, kind), or None to skip.
 
-    ``parse_mode`` is "HTML" for everything we emit. Skips meta records,
-    thinking blocks, tool results, and Claude's internal bookkeeping types.
+    ``parse_mode`` is "HTML" for everything we emit; ``kind`` is one of
+    ``user`` / ``text`` / ``tool`` so callers can coalesce runs of tool
+    one-liners into a single message (rate-limit relief in busy groups).
+    Skips meta records, thinking blocks, tool results, and Claude's internal
+    bookkeeping types.
     """
     t = obj.get("type")
 
@@ -283,7 +286,7 @@ def render_record(
             return None
         if len(text) > _MAX_USER_ECHO:
             text = text[:_MAX_USER_ECHO] + " …"
-        return (f"💬 <b>You</b>\n{escape_html(text)}", "HTML")
+        return (f"💬 <b>You</b>\n{escape_html(text)}", "HTML", "user")
 
     if t != "assistant":
         return None
@@ -299,9 +302,9 @@ def render_record(
         if bt == "text":
             txt = (block.get("text") or "").strip()
             if txt:
-                return (markdown_to_telegram_html(txt), "HTML")
+                return (markdown_to_telegram_html(txt), "HTML", "text")
         elif bt == "tool_use" and show_tools:
             line = _summarize_tool(block.get("name", ""), block.get("input") or {})
-            return (line, "HTML")
+            return (line, "HTML", "tool")
         # thinking -> skip
     return None
