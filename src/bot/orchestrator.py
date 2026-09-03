@@ -262,6 +262,10 @@ class MessageOrchestrator:
         # between the mirror watcher and the widget-remote key callbacks so a
         # phone keypress editing the snapshot doesn't get re-posted as new.
         self._last_prompt: Dict[BindingKey, Optional[str]] = {}
+        # bkey -> sig of the /usage card already posted, tracked separately
+        # from _last_prompt so subsequent polls can keep hammering Escape
+        # without re-posting the same card while the panel refuses to close.
+        self._usage_card_sent: Dict[BindingKey, str] = {}
         # bkey -> {"target": str, "mode": "mirror"|"snapshot"}, persisted so
         # tmux bindings + live mirrors survive a bot restart.
         self._bindings: Dict[BindingKey, Dict[str, str]] = self._load_bindings()
@@ -1660,6 +1664,7 @@ class MessageOrchestrator:
             task.cancel()
         self._mirror_echo.pop(bkey, None)
         self._last_prompt.pop(bkey, None)
+        self._usage_card_sent.pop(bkey, None)
 
     def _note_echo(self, bkey: BindingKey, text: str) -> None:
         """Record a phone-sent prompt so its mirror echo can be suppressed."""
@@ -1724,33 +1729,48 @@ class MessageOrchestrator:
             return last_prompt
         widget = is_question_widget(screen)
         if not widget and not is_interactive_prompt(screen):
+            self._usage_card_sent.pop(bkey, None)  # panel gone -> reset
             return None
         sig = prompt_signature(screen)
-        if sig == last_prompt:
-            return last_prompt  # already shown this exact prompt
 
         # A Usage/Stats panel (/usage) is a transient info overlay, not a real
         # input prompt — Claude closes it with Esc, not a reply. Show the parsed
         # card, then auto-Esc so the modal doesn't stay open swallowing the
-        # user's next message. Return sig so a lingering frame won't re-post.
+        # user's next message.
+        #
+        # Checked BEFORE the sig dedup because a single poll's Esc burst can
+        # miss (Claude still opening the panel, still loading data, or its
+        # event loop briefly not draining the pty). We want *subsequent* polls
+        # to keep hammering Esc across the 2s cadence until the panel closes;
+        # `_usage_card_sent` dedups the card body separately from `last_prompt`
+        # so those retries don't spam duplicate cards into the chat.
         card = render_usage(screen)
         if card:
-            await self._mirror_send(bot, bkey, card, "HTML")
-            # Auto-dismiss can miss if the first Esc lands while Claude is
-            # still opening the panel. Retry, re-checking after each press so
-            # we stop the instant it closes and never Esc a screen that's
-            # already back to the composer (which would interrupt a turn).
+            if self._usage_card_sent.get(bkey) != sig:
+                await self._mirror_send(bot, bkey, card, "HTML")
+                self._usage_card_sent[bkey] = sig
             bridge = self._tmux(target)
-            for _ in range(4):
+            for i in range(6):
                 try:
                     await bridge.send_key("Escape")
-                    await asyncio.sleep(0.5)
+                    # Scaling wait: first attempts land fast when the panel is
+                    # settled; later attempts give a still-loading panel time
+                    # to accept input before we check again.
+                    await asyncio.sleep(0.35 + i * 0.15)
                     if not render_usage(await bridge.capture()):
-                        break  # panel closed -- stop escaping
+                        # Closed. Clear card memo so a fresh /usage re-fires.
+                        self._usage_card_sent.pop(bkey, None)
+                        return None
                 except Exception as e:
                     logger.warning("usage auto-dismiss failed", error=str(e))
                     break
-            return sig
+            # All attempts failed this poll. Return `last_prompt` (not `sig`)
+            # so the *next* poll re-enters this branch and keeps trying Esc,
+            # instead of the sig dedup below wedging us open forever.
+            return last_prompt
+
+        if sig == last_prompt:
+            return last_prompt  # already shown this exact prompt
 
         if widget:
             # Multi-question widget: digits/Enter shortcuts would mis-answer
