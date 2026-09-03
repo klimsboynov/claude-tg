@@ -49,7 +49,7 @@ from .features.tmux_bridge import (
     split_host,
 )
 from .features.tmux_bridge import list_all_sessions as tmux_list_all_sessions
-from .features.usage_render import render_usage
+from .features.usage_render import looks_like_usage, render_usage
 from .utils.html_format import escape_html
 
 logger = structlog.get_logger()
@@ -1728,7 +1728,13 @@ class MessageOrchestrator:
         except Exception:
             return last_prompt
         widget = is_question_widget(screen)
-        if not widget and not is_interactive_prompt(screen):
+        # The /usage panel is a modal but its "esc to cancel" footer scrolls
+        # off-screen when the panel is taller than the pane (~30 rows vs the
+        # typical 29-row pane), so is_interactive_prompt (last-6-lines check)
+        # misses it. Detect the usage screen directly so a tall panel still
+        # enters this branch to be surfaced and auto-Esc'd.
+        usage_up = looks_like_usage(screen)
+        if not widget and not is_interactive_prompt(screen) and not usage_up:
             self._usage_card_sent.pop(bkey, None)  # panel gone -> reset
             return None
         sig = prompt_signature(screen)
