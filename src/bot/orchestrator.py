@@ -1771,11 +1771,20 @@ class MessageOrchestrator:
                     line += f"\n    <i>{escape_html(short)}</i>"
                 body_lines.append(line)
             body = "\n".join(body_lines)
+            # Show the full context box (command being run, danger warning, the
+            # question) so the user knows WHAT they're approving -- not just a
+            # bare "Do you want to proceed?".
+            ctx = menu.get("context") or menu.get("title") or ""
+            if len(ctx) > 1500:
+                ctx = ctx[:1500] + "\n…"
+            head = "⌨️ <b>Claude is asking</b>"
+            if ctx:
+                head += f"\n<pre>{escape_html(ctx)}</pre>"
             try:
                 await bot.send_message(
                     chat_id=bkey[0],
                     message_thread_id=bkey[1],
-                    text=f"⌨️ <b>{escape_html(menu['title'])}</b>\n\n{body}",
+                    text=f"{head}\n{body}",
                     reply_markup=InlineKeyboardMarkup(rows),
                     parse_mode="HTML",
                 )

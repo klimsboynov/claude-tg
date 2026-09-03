@@ -14,7 +14,7 @@ clean.
 
 import re
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ..utils.html_format import escape_html, markdown_to_telegram_html
 
@@ -168,21 +168,31 @@ def parse_menu(screen: str) -> Optional[dict]:  # type: ignore[type-arg]
         options.append((i, label, _desc(idx)))
         i += 1
 
-    title = "Claude is asking"
+    # Context block above the options: the command / danger warning / question
+    # a permission box shows. Walk up from the first option collecting real
+    # lines until a box border (or a small cap), skipping blank gutters -- so
+    # the user sees WHAT they're approving, not just "Do you want to proceed?".
+    context: List[str] = []
+    rule = set("─—-=_╭╮╰╯│├┤┬┴┼┃━ •")
     if first_idx is not None:
         for line in reversed(lines[:first_idx]):
             s = line.strip()
-            if not s or set(s) <= set("─—-=_• "):
-                continue
+            if not s:
+                continue  # box gutter -- skip, don't stop
+            if set(s) <= rule:
+                break  # box border ends the block
             low = s.lower()
             if any(
                 k in low
                 for k in ("to navigate", "enter to select", "esc to cancel")
             ):
                 continue
-            title = s
-            break
-    return {"title": title, "options": options}
+            context.append(s)
+            if len(context) >= 12:
+                break
+        context.reverse()
+    title = context[-1] if context else "Claude is asking"
+    return {"title": title, "context": "\n".join(context), "options": options}
 
 
 def _newest_jsonl(proj_dir: Path) -> Optional[Path]:
