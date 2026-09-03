@@ -886,6 +886,13 @@ class MessageOrchestrator:
         """Direct Claude passthrough. Simple progress. No suggestions."""
         user_id = update.effective_user.id
         message_text = update.message.text
+        # In groups Telegram appends @botusername to slash commands (e.g.
+        # "/usage@diddyclaudebot"). Passthrough commands are typed verbatim
+        # into the session, so strip the suffix from the first token -- Claude
+        # only knows "/usage", not "/usage@bot".
+        if message_text.startswith("/"):
+            head, sep, rest = message_text.partition(" ")
+            message_text = re.sub(r"@\w+$", "", head) + sep + rest
 
         logger.info(
             "Agentic text message",
