@@ -1736,10 +1736,20 @@ class MessageOrchestrator:
         card = render_usage(screen)
         if card:
             await self._mirror_send(bot, bkey, card, "HTML")
-            try:
-                await self._tmux(target).send_key("Escape")
-            except Exception as e:
-                logger.warning("usage auto-dismiss failed", error=str(e))
+            # Auto-dismiss can miss if the first Esc lands while Claude is
+            # still opening the panel. Retry, re-checking after each press so
+            # we stop the instant it closes and never Esc a screen that's
+            # already back to the composer (which would interrupt a turn).
+            bridge = self._tmux(target)
+            for _ in range(4):
+                try:
+                    await bridge.send_key("Escape")
+                    await asyncio.sleep(0.5)
+                    if not render_usage(await bridge.capture()):
+                        break  # panel closed -- stop escaping
+                except Exception as e:
+                    logger.warning("usage auto-dismiss failed", error=str(e))
+                    break
             return sig
 
         if widget:
