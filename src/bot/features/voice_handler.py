@@ -33,6 +33,15 @@ class VoiceHandler:
     # Timeout (seconds) for ffmpeg and whisper.cpp subprocess calls.
     LOCAL_SUBPROCESS_TIMEOUT: int = 120
 
+    # Per-call HTTP timeouts for the Telegram file download. The bot's global
+    # HTTPX read_timeout is 30s, which is too tight for a multi-minute voice
+    # message: with a local Bot API server, getFile is synchronous — tbapi
+    # pulls the whole file from Telegram before responding — so a 3+ minute
+    # voice can push past 30s and surface as `telegram.error.TimedOut`.
+    VOICE_DOWNLOAD_READ_TIMEOUT: float = 300.0
+    VOICE_DOWNLOAD_WRITE_TIMEOUT: float = 60.0
+    VOICE_DOWNLOAD_CONNECT_TIMEOUT: float = 30.0
+
     def __init__(self, config: Settings):
         self.config = config
         self._mistral_client: Optional[Any] = None
@@ -69,8 +78,16 @@ class VoiceHandler:
         initial_file_size = getattr(voice, "file_size", None)
         self._ensure_allowed_file_size(initial_file_size)
 
-        # Resolve Telegram file metadata before downloading bytes.
-        file = await voice.get_file()
+        # Resolve Telegram file metadata before downloading bytes. Bump the
+        # per-call HTTP timeouts here: getFile against a local Bot API server
+        # blocks until tbapi has pulled the file from Telegram, and that
+        # network hop for a multi-minute voice can exceed the bot's global
+        # 30s read_timeout — see VOICE_DOWNLOAD_*_TIMEOUT above.
+        file = await voice.get_file(
+            read_timeout=self.VOICE_DOWNLOAD_READ_TIMEOUT,
+            write_timeout=self.VOICE_DOWNLOAD_WRITE_TIMEOUT,
+            connect_timeout=self.VOICE_DOWNLOAD_CONNECT_TIMEOUT,
+        )
         resolved_file_size = getattr(file, "file_size", None)
         self._ensure_allowed_file_size(resolved_file_size)
 
@@ -83,8 +100,14 @@ class VoiceHandler:
                 "Please retry with a smaller voice message."
             )
 
-        # Download voice data
-        voice_bytes = bytes(await file.download_as_bytearray())
+        # Download voice data (same generous timeouts — with a local Bot API
+        # server this is a filesystem read; without one, it's an HTTP fetch
+        # that scales with the file size).
+        voice_bytes = bytes(
+            await file.download_as_bytearray(
+                read_timeout=self.VOICE_DOWNLOAD_READ_TIMEOUT,
+            )
+        )
         self._ensure_allowed_file_size(len(voice_bytes))
 
         logger.info(
