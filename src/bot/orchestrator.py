@@ -898,6 +898,27 @@ class MessageOrchestrator:
             head, sep, rest = message_text.partition(" ")
             message_text = re.sub(r"@\w+$", "", head) + sep + rest
 
+        # Reply-to-voice retry: if this text is a reply to an earlier voice
+        # message, re-transcribe THAT voice instead of routing the reply text.
+        # Lets the user retry a failed/timed-out transcription without
+        # re-recording (forwarding would drop the .ogg into the pane's cwd as
+        # a file upload; a plain re-send isn't possible in the TG UI). Any
+        # reply text becomes the caption prepended to the transcription.
+        reply = update.message.reply_to_message
+        if reply and reply.voice:
+            binding = self._binding(self._bkey(update))
+            if not binding:
+                await self._prompt_bind(update)
+                return
+            await self._tmux_voice(
+                update,
+                context,
+                binding,
+                voice=reply.voice,
+                caption=(message_text or None),
+            )
+            return
+
         logger.info(
             "Agentic text message",
             user_id=user_id,
@@ -1608,7 +1629,15 @@ class MessageOrchestrator:
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         binding: Dict[str, str],
+        voice: Optional[Any] = None,
+        caption: Optional[str] = None,
     ) -> None:
+        # Explicit `voice` overrides `update.message.voice` -- used when the
+        # user REPLIES to an earlier voice message (they can't just re-send it
+        # without re-recording, and forwarding lands it as a file upload). We
+        # then transcribe the replied-to voice instead of the reply text.
+        voice = voice or update.message.voice
+        caption = caption if caption is not None else update.message.caption
         features = context.bot_data.get("features")
         voice_handler = features.get_voice_handler() if features else None
         if not voice_handler:
@@ -1616,9 +1645,7 @@ class MessageOrchestrator:
             return
         progress = await update.message.reply_text("Transcribing…")
         try:
-            processed = await voice_handler.process_voice_message(
-                update.message.voice, update.message.caption
-            )
+            processed = await voice_handler.process_voice_message(voice, caption)
         except Exception as e:
             from .handlers.message import _format_error_message
 
