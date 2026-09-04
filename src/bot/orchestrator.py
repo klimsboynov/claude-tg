@@ -269,6 +269,10 @@ class MessageOrchestrator:
         # bkey -> {"target": str, "mode": "mirror"|"snapshot"}, persisted so
         # tmux bindings + live mirrors survive a bot restart.
         self._bindings: Dict[BindingKey, Dict[str, str]] = self._load_bindings()
+        # chat_id -> set of thread_ids created by /sync_tmux, persisted so
+        # subsequent runs can close+delete orphan topics whose binding was
+        # lost (Bot API can't list a group's existing topics).
+        self._created_topics: Dict[int, set] = self._load_created_topics()
 
     # --- persistent tmux bindings ---
 
@@ -324,6 +328,42 @@ class MessageOrchestrator:
     def _clear_binding(self, bkey: BindingKey) -> None:
         if self._bindings.pop(bkey, None) is not None:
             self._save_bindings()
+
+    # --- persistent /sync_tmux created-topics ledger ---
+
+    def _created_topics_path(self) -> Path:
+        url = self.settings.database_url
+        db = url[len("sqlite:///") :] if url.startswith("sqlite:///") else "data/bot.db"
+        parent = Path(db).parent if db else Path("data")
+        return parent / "tmux_created_topics.json"
+
+    def _load_created_topics(self) -> Dict[int, set]:
+        try:
+            raw = json.loads(self._created_topics_path().read_text(encoding="utf-8"))
+            return {int(c): set(int(t) for t in ts) for c, ts in raw.items()}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def _save_created_topics(self) -> None:
+        try:
+            path = self._created_topics_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {str(c): sorted(ts) for c, ts in self._created_topics.items() if ts}
+            path.write_text(json.dumps(data), encoding="utf-8")
+        except OSError as e:
+            logger.warning("Failed to persist created topics ledger", error=str(e))
+
+    def _record_created_topic(self, chat_id: int, thread_id: int) -> None:
+        self._created_topics.setdefault(chat_id, set()).add(thread_id)
+        self._save_created_topics()
+
+    def _forget_created_topic(self, chat_id: int, thread_id: int) -> None:
+        s = self._created_topics.get(chat_id)
+        if s and thread_id in s:
+            s.discard(thread_id)
+            if not s:
+                self._created_topics.pop(chat_id, None)
+            self._save_created_topics()
 
     async def restore_mirrors(self, bot: Any) -> None:
         """Re-establish live mirrors for persisted bindings after a restart."""
@@ -2222,6 +2262,12 @@ class MessageOrchestrator:
             for k, v in self._bindings.items()
             if k[0] == chat.id and k[1] is not None
         }
+        # First-run seed: adopt every currently-bound topic into the ledger
+        # so subsequent syncs can identify it as one of ours (or as an
+        # orphan once its binding disappears).
+        for _, bkey in bound.items():
+            if bkey[1] is not None:
+                self._record_created_topic(chat.id, bkey[1])
         pace = float(
             getattr(
                 self.settings,
@@ -2242,6 +2288,7 @@ class MessageOrchestrator:
                 failed.append(name)
                 continue
             bkey = (chat.id, topic.message_thread_id)
+            self._record_created_topic(chat.id, topic.message_thread_id)
             mode_line = await self._bind_session(context.bot, bkey, name)
             try:
                 await context.bot.send_message(
@@ -2275,7 +2322,34 @@ class MessageOrchestrator:
                 )
             except Exception as e:
                 logger.warning("topic close failed", name=name, error=str(e))
+            self._forget_created_topic(bkey[0], bkey[1])
             closed.append(name)
+            if pace:
+                await asyncio.sleep(pace)
+
+        # Orphan reconciliation: topics we created in earlier runs whose
+        # binding was lost (crash, wiped bindings file, mismatched target
+        # string). Delete them outright -- Bot API can't list existing
+        # topics so this ledger is the only handle we have on them.
+        live_threads = {
+            k[1] for k in self._bindings if k[0] == chat.id and k[1] is not None
+        }
+        orphans = sorted((self._created_topics.get(chat.id, set())) - live_threads)
+        deleted = 0
+        for thread_id in orphans:
+            try:
+                await context.bot.delete_forum_topic(
+                    chat_id=chat.id, message_thread_id=thread_id
+                )
+                deleted += 1
+            except Exception as e:
+                logger.warning(
+                    "orphan topic delete failed",
+                    chat_id=chat.id,
+                    thread_id=thread_id,
+                    error=str(e),
+                )
+            self._forget_created_topic(chat.id, thread_id)
             if pace:
                 await asyncio.sleep(pace)
 
@@ -2283,6 +2357,8 @@ class MessageOrchestrator:
         parts = [f"🗂 topics: +{len(created)} created, {kept} kept"]
         if closed:
             parts.append(f"{len(closed)} closed ({', '.join(closed[:5])})")
+        if deleted:
+            parts.append(f"{deleted} orphan(s) deleted")
         if failed:
             parts.append(f"⚠️ failed: {', '.join(failed[:5])}")
         if unreachable:
