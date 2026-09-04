@@ -1025,6 +1025,16 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "<code>WHISPER_CPP_MODEL_PATH</code> if needed.",
                 parse_mode="HTML",
             )
+        elif settings.voice_provider == "faster-whisper":
+            await update.message.reply_text(
+                "🎙️ <b>Voice Messages</b>\n\n"
+                "Voice transcription is not available.\n"
+                "Provider: <code>faster-whisper (local)</code>\n"
+                "Install the extra: "
+                '<code>pip install "claude-code-telegram[voice]"</code> '
+                "(or <code>pip install faster-whisper</code>), then restart.",
+                parse_mode="HTML",
+            )
         else:
             await update.message.reply_text(
                 "🎙️ <b>Voice Messages</b>\n\n"

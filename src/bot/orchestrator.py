@@ -991,6 +991,13 @@ class MessageOrchestrator:
                 "Ensure whisper.cpp is installed and the model file exists. "
                 "Check WHISPER_CPP_BINARY_PATH and WHISPER_CPP_MODEL_PATH settings."
             )
+        if self.settings.voice_provider == "faster-whisper":
+            return (
+                "Voice processing is not available. "
+                "Install the faster-whisper extra: "
+                'pip install "claude-code-telegram[voice]" '
+                "(or: pip install faster-whisper), then restart the bot."
+            )
         return (
             "Voice processing is not available. "
             f"Set {self.settings.voice_provider_api_key_env} "
