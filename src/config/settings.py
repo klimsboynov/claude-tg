@@ -215,9 +215,12 @@ class Settings(BaseSettings):
     enable_voice_messages: bool = Field(
         True, description="Enable voice message transcription"
     )
-    voice_provider: Literal["mistral", "openai", "local"] = Field(
+    voice_provider: Literal["mistral", "openai", "local", "faster-whisper"] = Field(
         "mistral",
-        description="Voice transcription provider: 'mistral', 'openai', or 'local'",
+        description=(
+            "Voice transcription provider: 'mistral', 'openai', "
+            "'local' (whisper.cpp), or 'faster-whisper' (in-process CTranslate2)"
+        ),
     )
     mistral_api_key: Optional[SecretStr] = Field(
         None, description="Mistral API key for voice transcription"
@@ -254,6 +257,36 @@ class Settings(BaseSettings):
             "Path to whisper.cpp GGML model file, or model name "
             "(e.g. 'base', 'small'). Defaults to 'base'. "
             "Named models resolve to ~/.cache/whisper-cpp/ggml-{name}.bin"
+        ),
+    )
+    faster_whisper_model: Optional[str] = Field(
+        None,
+        description=(
+            "faster-whisper model size or Systran repo id "
+            "(e.g. 'tiny', 'base', 'small', 'medium', 'large-v3', "
+            "'distil-large-v3'). Defaults to 'small'. First use pulls the "
+            "model from HuggingFace into ~/.cache/huggingface/hub."
+        ),
+    )
+    faster_whisper_device: str = Field(
+        "cpu",
+        description=(
+            "faster-whisper compute device: 'cpu', 'cuda', or 'auto'. "
+            "'cuda' requires a working CUDA + cuDNN install."
+        ),
+    )
+    faster_whisper_compute_type: str = Field(
+        "int8",
+        description=(
+            "faster-whisper compute precision. CPU: 'int8' (fast) / "
+            "'int8_float32'. CUDA: 'float16' / 'int8_float16'."
+        ),
+    )
+    faster_whisper_language: Optional[str] = Field(
+        None,
+        description=(
+            "Force a language code (e.g. 'en', 'ru') for faster-whisper. "
+            "Leave unset to auto-detect per utterance."
         ),
     )
     enable_quick_actions: bool = Field(True, description="Enable quick action buttons")
@@ -485,9 +518,10 @@ class Settings(BaseSettings):
         if v is None:
             return "mistral"
         provider = str(v).strip().lower()
-        if provider not in {"mistral", "openai", "local"}:
+        if provider not in {"mistral", "openai", "local", "faster-whisper"}:
             raise ValueError(
-                "voice_provider must be one of ['mistral', 'openai', 'local']"
+                "voice_provider must be one of "
+                "['mistral', 'openai', 'local', 'faster-whisper']"
             )
         return provider
 
@@ -597,6 +631,8 @@ class Settings(BaseSettings):
             return "whisper-1"
         if self.voice_provider == "local":
             return self.whisper_cpp_model_path or "base"
+        if self.voice_provider == "faster-whisper":
+            return self.faster_whisper_model or "small"
         return "voxtral-mini-latest"
 
     @property
@@ -609,7 +645,7 @@ class Settings(BaseSettings):
         """API key environment variable required for the configured voice provider."""
         if self.voice_provider == "openai":
             return "OPENAI_API_KEY"
-        if self.voice_provider == "local":
+        if self.voice_provider in ("local", "faster-whisper"):
             return ""
         return "MISTRAL_API_KEY"
 
@@ -620,6 +656,8 @@ class Settings(BaseSettings):
             return "OpenAI Whisper"
         if self.voice_provider == "local":
             return "Local whisper.cpp"
+        if self.voice_provider == "faster-whisper":
+            return "faster-whisper (local)"
         return "Mistral Voxtral"
 
     @property

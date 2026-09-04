@@ -1,4 +1,5 @@
-"""Handle voice message transcription via Mistral (Voxtral), OpenAI (Whisper), or local whisper.cpp."""
+"""Handle voice message transcription via Mistral (Voxtral), OpenAI (Whisper),
+local whisper.cpp, or in-process faster-whisper (CTranslate2)."""
 
 import asyncio
 import shutil
@@ -26,7 +27,8 @@ class ProcessedVoice:
 
 
 class VoiceHandler:
-    """Transcribe Telegram voice messages using Mistral, OpenAI, or local whisper.cpp."""
+    """Transcribe Telegram voice messages using Mistral, OpenAI, whisper.cpp,
+    or in-process faster-whisper."""
 
     # Timeout (seconds) for ffmpeg and whisper.cpp subprocess calls.
     LOCAL_SUBPROCESS_TIMEOUT: int = 120
@@ -36,6 +38,10 @@ class VoiceHandler:
         self._mistral_client: Optional[Any] = None
         self._openai_client: Optional[Any] = None
         self._resolved_whisper_binary: Optional[str] = None
+        # faster-whisper WhisperModel: heavy (100MB+ RAM once loaded), so we
+        # cache it here for the process lifetime -- first voice message pays
+        # the load cost, every subsequent one reuses the resident model.
+        self._faster_whisper_model: Optional[Any] = None
 
     def _ensure_allowed_file_size(self, file_size: Optional[int]) -> None:
         """Reject files that exceed the configured max size."""
@@ -56,7 +62,8 @@ class VoiceHandler:
         """Download and transcribe a voice message.
 
         1. Download .ogg bytes from Telegram
-        2. Call the configured transcription provider (Mistral, OpenAI, or local)
+        2. Call the configured transcription provider
+           (mistral / openai / local whisper.cpp / faster-whisper)
         3. Build a prompt combining caption + transcription
         """
         initial_file_size = getattr(voice, "file_size", None)
@@ -89,6 +96,8 @@ class VoiceHandler:
 
         if self.config.voice_provider == "local":
             transcription = await self._transcribe_local(voice_bytes)
+        elif self.config.voice_provider == "faster-whisper":
+            transcription = await self._transcribe_faster_whisper(voice_bytes)
         elif self.config.voice_provider == "openai":
             transcription = await self._transcribe_openai(voice_bytes)
         else:
@@ -347,3 +356,77 @@ class VoiceHandler:
             )
         self._resolved_whisper_binary = resolved
         return resolved
+
+    # -- Local faster-whisper (CTranslate2) provider --
+
+    async def _transcribe_faster_whisper(self, voice_bytes: bytes) -> str:
+        """Transcribe audio in-process with faster-whisper.
+
+        faster-whisper decodes container formats itself via PyAV, so we hand
+        it the raw Telegram ``.ogg`` bytes on disk and skip the ffmpeg step
+        the whisper.cpp path needs. Inference runs in a thread so the asyncio
+        loop isn't blocked while the (CPU-bound) model decodes.
+        """
+        model = self._get_faster_whisper_model()
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="voice_fw_")
+            ogg_path = Path(tmp_dir) / "voice.ogg"
+            ogg_path.write_bytes(voice_bytes)
+            text = await asyncio.to_thread(
+                self._run_faster_whisper, model, str(ogg_path)
+            )
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        text = text.strip()
+        if not text:
+            raise ValueError(
+                "faster-whisper transcription returned an empty response."
+            )
+        return text
+
+    def _run_faster_whisper(self, model: Any, audio_path: str) -> str:
+        """Blocking transcribe -- called from asyncio.to_thread."""
+        kwargs: dict = {"vad_filter": True}
+        if self.config.faster_whisper_language:
+            kwargs["language"] = self.config.faster_whisper_language
+        try:
+            segments, _info = model.transcribe(audio_path, **kwargs)
+            # segments is a lazy generator; joining forces the actual decode.
+            return "".join(seg.text for seg in segments)
+        except Exception as exc:
+            logger.warning(
+                "faster-whisper transcription failed",
+                error_type=type(exc).__name__,
+            )
+            raise RuntimeError("faster-whisper transcription failed.") from exc
+
+    def _get_faster_whisper_model(self) -> Any:
+        """Load and cache the faster-whisper WhisperModel on first use."""
+        if self._faster_whisper_model is not None:
+            return self._faster_whisper_model
+
+        try:
+            from faster_whisper import WhisperModel
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "Optional dependency 'faster-whisper' is missing. "
+                'Install voice extras: pip install "claude-code-telegram[voice]" '
+                "-- or: pip install faster-whisper"
+            ) from exc
+
+        model_name = self.config.resolved_voice_model  # e.g. 'small' or a repo id
+        logger.info(
+            "Loading faster-whisper model",
+            model=model_name,
+            device=self.config.faster_whisper_device,
+            compute_type=self.config.faster_whisper_compute_type,
+        )
+        self._faster_whisper_model = WhisperModel(
+            model_name,
+            device=self.config.faster_whisper_device,
+            compute_type=self.config.faster_whisper_compute_type,
+        )
+        return self._faster_whisper_model
