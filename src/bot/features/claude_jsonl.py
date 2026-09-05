@@ -133,12 +133,21 @@ def prompt_signature(screen: str) -> str:
 
     Drops volatile (timer) lines and the leading highlight marker (``❯``) so a
     moving selection cursor doesn't read as a different prompt.
+
+    Also redacts the *label text* on numbered option lines (keeps ``N.`` /
+    ``N)`` but strips whatever comes after), because the "Type something" slot
+    updates its label live as the user types -- without this, every keystroke
+    produces a fresh signature and the menu card gets re-posted to Telegram on
+    each poll. Option descriptions on the following indented lines still stay
+    in the sig, so distinct menus remain distinguishable.
     """
     out = []
     for line in screen.splitlines():
         if not line.strip() or _VOLATILE_LINE.search(line):
             continue
-        out.append(re.sub(r"^\s*[❯>›»]\s*", "", line).rstrip())
+        line = re.sub(r"^\s*[❯>›»]\s*", "", line)
+        line = re.sub(r"^\s*(\d+[.)])\s+.*$", r"\1", line)
+        out.append(line.rstrip())
     return "\n".join(out)
 
 
