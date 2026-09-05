@@ -102,6 +102,32 @@ def is_interactive_prompt(screen: str) -> bool:
     return any(m in low for m in _PROMPT_MARKERS)
 
 
+def looks_like_menu(screen: str) -> bool:
+    """Full-screen fallback for a Claude TUI selection menu.
+
+    ``is_interactive_prompt`` scans only the last ~6 non-empty lines, so a menu
+    whose widget renders extra content below its footer (e.g. the ``N tasks``
+    todo strip) pushes the ``Enter to select … Esc to cancel`` footer out of
+    the tail and the detector misses the prompt entirely.
+
+    This checker scans every line for the compound-marker footer (both
+    ``enter to select`` and ``esc to cancel`` on the SAME line -- Claude's
+    literal format is ``Enter to select · ↑/↓ to navigate · Esc to cancel``),
+    which is tight enough that scrollback prose or this source file mentioning
+    either phrase alone can't trip it. Still guarded by the input-box footer:
+    if the normal typing box is live in the tail, no menu is up.
+    """
+    tail = [ln for ln in screen.splitlines() if ln.strip()][-6:]
+    low_tail = "\n".join(tail).lower()
+    if any(m in low_tail for m in _INPUT_FOOTER):
+        return False
+    for ln in screen.splitlines():
+        low = ln.lower()
+        if "enter to select" in low and "esc to cancel" in low:
+            return True
+    return False
+
+
 def prompt_signature(screen: str) -> str:
     """Stable identity of a prompt screen.
 

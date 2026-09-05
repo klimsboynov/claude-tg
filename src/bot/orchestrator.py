@@ -37,6 +37,7 @@ from ..projects import PrivateTopicsUnavailableError
 from .features.claude_jsonl import (
     is_interactive_prompt,
     is_question_widget,
+    looks_like_menu,
     parse_menu,
     prompt_signature,
     render_record,
@@ -1808,7 +1809,18 @@ class MessageOrchestrator:
         # misses it. Detect the usage screen directly so a tall panel still
         # enters this branch to be surfaced and auto-Esc'd.
         usage_up = looks_like_usage(screen)
-        if not widget and not is_interactive_prompt(screen) and not usage_up:
+        # Same tall-panel failure as /usage: a selection menu that renders
+        # extra content below its footer (e.g. the "N tasks" todo strip)
+        # pushes the "Enter to select · Esc to cancel" line out of
+        # is_interactive_prompt's last-6-lines window. looks_like_menu
+        # scans the whole screen for the compound footer as a fallback.
+        menu_up = looks_like_menu(screen)
+        if (
+            not widget
+            and not is_interactive_prompt(screen)
+            and not usage_up
+            and not menu_up
+        ):
             self._usage_card_sent.pop(bkey, None)  # panel gone -> reset
             return None
         sig = prompt_signature(screen)
